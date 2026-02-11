@@ -21,7 +21,7 @@ from telebot.types import (
 
 # CONFIG
 OWNER_ID = int(os.environ.get("OWNER_ID", "7739179390"))
-MAX_LIFE_STAKES = 3  # сколько раз можно поставить 'жизнь'
+MAX_LIFE_STAKES = 3  # сколько раз можно поставить жизнь
 BOT_TOKEN = "8356498848:AAFk3dhwWPdwDHYsfHLOKgD5CxcDTtITQ4Y"
 
 bot = TeleBot(BOT_TOKEN, threaded=True, num_threads=8)
@@ -1091,11 +1091,6 @@ def shop_get_active(uid: int) -> dict:
     return {k: int(v or 0) for (k, v) in rows}
 
 def render_active_boosts(active: dict) -> str:
-    """
-    Формат для итогов хода:
-    Текущие усиления:
-    🧲 Магнит 🍀 Фальшивый клевер ...
-    """
     try:
         parts = []
         for k, v in (active or {}).items():
@@ -1104,7 +1099,7 @@ def render_active_boosts(active: dict) -> str:
             title = SHOP_ITEMS.get(k, {}).get("title", k)
             parts.append(title)
         if not parts:
-            return "Текущие усиления:\n—"
+            return
         return "Текущие усиления:\n" + " ".join(parts)
     except Exception:
         return
