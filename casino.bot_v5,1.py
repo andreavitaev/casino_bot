@@ -609,90 +609,92 @@ def load_contract_text() -> str:
         return f.read()
 
 def is_registered(uid: int) -> bool:
-    cur.execute("SELECT 1 FROM users WHERE user_id=?", (uid,))
-    return cur.fetchone() is not None
+    r = db_one("SELECT 1 FROM users WHERE user_id=?", (int(uid),))
+    return r is not None
 
 def upsert_user(uid: int, username: Optional[str]):
-    cur.execute("""
+    db_exec("""
     INSERT INTO users (user_id, username, created_ts)
     VALUES (?,?,?)
     ON CONFLICT(user_id) DO UPDATE SET username=COALESCE(excluded.username, users.username)
-    """, (uid, username, now_ts()))
-    conn.commit()
+    """, (int(uid), username, now_ts()), commit=True)
 
 def set_short_name(uid: int, name: str):
     upsert_user(uid, None)
-    cur.execute("UPDATE users SET short_name=? WHERE user_id=?", (name, uid))
-    conn.commit()
+    db_exec("UPDATE users SET short_name=? WHERE user_id=?", (name, int(uid)), commit=True)
 
 def get_user(uid: int):
-    cur.execute("SELECT user_id, username, short_name, created_ts, contract_ts, balance_cents, demo_gift_cents, demon FROM users WHERE user_id=?", (uid,))
-    return cur.fetchone()
+    return db_one(
+        "SELECT user_id, username, short_name, created_ts, contract_ts, balance_cents, demo_gift_cents, demon "
+        "FROM users WHERE user_id=?",
+        (int(uid),)
+    )
 
 def set_reg_state(uid: int, stage: Optional[str], msg_id: Optional[int]):
-    cur.execute("""
+    db_exec("""
     INSERT INTO reg_state (user_id, stage, msg_id, last_ts)
     VALUES (?,?,?,?)
     ON CONFLICT(user_id) DO UPDATE SET stage=excluded.stage, msg_id=excluded.msg_id, last_ts=excluded.last_ts
-    """, (uid, stage, msg_id, now_ts()))
-    conn.commit()
+    """, (int(uid), stage, msg_id, now_ts()), commit=True)
 
 def get_reg_state(uid: int):
-    cur.execute("SELECT stage, msg_id FROM reg_state WHERE user_id=?", (uid,))
-    row = cur.fetchone()
+    row = db_one("SELECT stage, msg_id FROM reg_state WHERE user_id=?", (int(uid),))
     return row if row else (None, None)
 
 def wipe_user(uid: int):
-    cur.execute("DELETE FROM users WHERE user_id=?", (uid,))
-    cur.execute("DELETE FROM reg_state WHERE user_id=?", (uid,))
-    cur.execute("DELETE FROM daily_mail WHERE user_id=?", (uid,))
-    cur.execute("DELETE FROM game_stats WHERE user_id=?", (uid,))
-    cur.execute("DELETE FROM slavery WHERE slave_id=? OR owner_id=?", (uid, uid))
-    conn.commit()
+    uid = int(uid)
+    db_exec("DELETE FROM users WHERE user_id=?", (uid,), commit=True)
+    db_exec("DELETE FROM reg_state WHERE user_id=?", (uid,), commit=True)
+    db_exec("DELETE FROM daily_mail WHERE user_id=?", (uid,), commit=True)
+    db_exec("DELETE FROM game_stats WHERE user_id=?", (uid,), commit=True)
+    db_exec("DELETE FROM slavery WHERE slave_id=? OR owner_id=?", (uid, uid), commit=True)
 
 def add_balance(uid: int, delta_cents: int):
-    upsert_user(uid, None)
-    cur.execute("UPDATE users SET balance_cents = COALESCE(balance_cents,0) + ? WHERE user_id=?", (int(delta_cents), uid))
-    conn.commit()
+    upsert_user(int(uid), None)
+    db_exec(
+        "UPDATE users SET balance_cents = COALESCE(balance_cents,0) + ? WHERE user_id=?",
+        (int(delta_cents), int(uid)),
+        commit=True
+    )
 
 def set_contract_signed(uid: int, gift_cents: int):
-    cur.execute("""
+    db_exec("""
     UPDATE users
     SET contract_ts=?, demo_gift_cents=?, balance_cents=COALESCE(balance_cents,0)+?
     WHERE user_id=?
-    """, (now_ts(), gift_cents, gift_cents, uid))
-    conn.commit()
-    ensure_daily_mail_row(uid)
+    """, (now_ts(), int(gift_cents), int(gift_cents), int(uid)), commit=True)
+    ensure_daily_mail_row(int(uid))
 
 # Daily mail
 MAIL_INTRO_DELAY_SEC = 8 * 3600
 MAIL_PERIOD_SEC = 24 * 3600
 
 def ensure_daily_mail_row(uid: int):
-    cur.execute(
+    db_exec(
         "INSERT OR IGNORE INTO daily_mail (user_id, next_ts, intro_sent, stopped, pending_amt_cents, pending_kind, pending_msg_id) "
         "VALUES (?,?,?,?,?,?,?)",
-        (uid, now_ts() + MAIL_INTRO_DELAY_SEC, 0, 0, 0, None, 0),
+        (int(uid), now_ts() + MAIL_INTRO_DELAY_SEC, 0, 0, 0, None, 0),
+        commit=True
     )
-    conn.commit()
 
 def stop_daily_mail(uid: int):
-    cur.execute("UPDATE daily_mail SET stopped=1, pending_amt_cents=0, pending_kind=NULL, pending_msg_id=0 WHERE user_id=?", (uid,))
-    conn.commit()
+    db_exec(
+        "UPDATE daily_mail SET stopped=1, pending_amt_cents=0, pending_kind=NULL, pending_msg_id=0 WHERE user_id=?",
+        (int(uid),),
+        commit=True
+    )
 
 def get_games_total(uid: int) -> int:
-    cur.execute("SELECT games_total FROM game_stats WHERE user_id=?", (uid,))
-    row = cur.fetchone()
+    row = db_one("SELECT games_total FROM game_stats WHERE user_id=?", (int(uid),))
     return int((row[0] if row else 0) or 0)
 
 def bump_game_type_stat(uid: int, game_type: str) -> None:
-    """Увеличить счётчик выбранной игры (для 'Часто играет')."""
     if not game_type:
         return
+    uid = int(uid)
     try:
-        cur.execute("INSERT OR IGNORE INTO game_type_stats (user_id, game_type, cnt) VALUES (?,?,0)", (uid, game_type))
-        cur.execute("UPDATE game_type_stats SET cnt=cnt+1 WHERE user_id=? AND game_type=?", (uid, game_type))
-        conn.commit()
+        db_exec("INSERT OR IGNORE INTO game_type_stats (user_id, game_type, cnt) VALUES (?,?,0)", (uid, game_type), commit=True)
+        db_exec("UPDATE game_type_stats SET cnt=cnt+1 WHERE user_id=? AND game_type=?", (uid, game_type), commit=True)
     except Exception:
         pass
 
