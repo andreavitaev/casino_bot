@@ -2369,7 +2369,7 @@ def on_private_text(message):
     gift = 1000 * 100
     set_contract_signed(uid, gift)
 
-    bot.send_message(message.chat.id, "В конверте также лежал чек на сумму 1000$")
+    bot.send_message(message.chat.id, "<i>В конверте также лежал чек на сумму <b>1000$</b>. Подпись:</i> Дополнительная финансовая поддержка придёт позже. Куратор.", parse_mode="HTML")
 
     set_reg_state(uid, None, None)
 
@@ -2774,6 +2774,7 @@ def on_main_callbacks(call: CallbackQuery):
             f"Название деятельности: <b>{html_escape(job.title)}</b>\n"
             f"Зарплата: <b>{cents_to_money_str(salary_full)}</b>$\n"
             f"Продолжительность рабочего дня: <b>{job.hours}</b> ч\n"
+            "Подтверждая свой выбор, вы автоматически отказываетесь от финансовой поддержки куратора.\n"
             "Интересует?"
         )
 
