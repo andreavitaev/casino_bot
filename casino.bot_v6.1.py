@@ -192,7 +192,7 @@ PREFIX_LEN = 12
 conn = sqlite3.connect(DB_PATH, check_same_thread=False)
 conn.execute("PRAGMA journal_mode=WAL;")
 conn.execute("PRAGMA synchronous=NORMAL;")
-conn.execute("PRAGMA busy_timeout=5000;")
+conn.execute("PRAGMA busy_timeout=8000;")
 conn.execute("PRAGMA wal_autocheckpoint=2000;")  # ~8MB при page_size=4096
 try: #проверка 2
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
@@ -965,9 +965,7 @@ def _mail_letter_text(kind: str, amount_cents: int) -> str:
         body = "Анонимный доброжелатель заметил вашу отдачу. Примите в качестве его благодарности скромный подарок."
 
     return (
-        "<i>Текст письма:</i>\n"
         f"{html_escape(body)}\n"
-        f"<i>К письму прилагался чек на</i> <b>{amt}</b>$"
     )
 
 def _send_mail_prompt(uid: int, kind: str, amount_cents: int) -> None:
@@ -1652,7 +1650,7 @@ def _salary_with_seniority(job: JobDef, days: int) -> int:
     for need, _ in job.ranks:
         if days >= need:
             thresholds += 1
-    mult = 1.0 + 0.05 * max(0, thresholds - 1)
+    mult = 1.0 + 0.1 * max(0, thresholds - 1)
     return int(round(job.base_salary_cents * mult))
 
 def get_current_shift(uid: int):
