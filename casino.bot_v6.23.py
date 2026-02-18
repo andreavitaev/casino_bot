@@ -4924,7 +4924,7 @@ def on_spin_pull(call: CallbackQuery):
                         final_balance = min(predicted, bal_now, target)
                         delta = int(final_balance - bal_now)
                         if final_balance < 0:
-                            set_slave_buyout(uid, abs(int(final_balance)) * 25) # назначение цены рабу
+                            set_slave_buyout(uid, abs(int(final_balance)) * 100) # назначение цены рабу
                     
             # Дьявольский перец
             if pepper_on and pepper_triggers_demon(final_state, rfmt):
@@ -4991,7 +4991,7 @@ def on_spin_pull(call: CallbackQuery):
                 return
                     
             if (not is_demon) and (pstatus == "life") and (delta < 0) and creator_id:
-                set_slave_buyout(uid, abs(delta) * 25) # назначение цены рабу
+                set_slave_buyout(uid, abs(delta) * 100) # назначение цены рабу
                 owner_id = pick_life_owner(game_id, int(uid), int(creator_id) if creator_id else None)
                 if owner_id and int(owner_id) != int(uid):
                     db_exec("INSERT OR IGNORE INTO slave_meta (slave_id) VALUES (?)", (int(uid),), commit=True)
@@ -5485,10 +5485,10 @@ def apply_demon_life_settlement(game_id: str):
     w_is_demon = bool(w and int(w[7] or 0) == 1)
     l_is_demon = bool(l and int(l[7] or 0) == 1)
 
-    # демон проиграл обычному: перевод 50% капитала + письмо
+    # демон проиграл обычному: перевод % капитала + письмо
     if l_is_demon and (not w_is_demon):
         demon_bal = get_balance_cents(loser_id)
-        payout = demon_bal // 2
+        payout = demon_bal // 4 # % капитала
         if payout > 0:
             add_balance(loser_id, -payout)
 
