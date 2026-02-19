@@ -660,8 +660,38 @@ CREATE TABLE IF NOT EXISTS transfers (
   from_id INTEGER NOT NULL,
   to_id INTEGER NOT NULL,
   amount_cents INTEGER NOT NULL,
+  fee_cents INTEGER DEFAULT 0,
   ts INTEGER NOT NULL,
   comment TEXT,
+  chat_id INTEGER DEFAULT 0,
+  msg_id INTEGER DEFAULT 0
+)
+""")
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS transfer_blocks (
+  user_id INTEGER PRIMARY KEY,
+  until_ts INTEGER NOT NULL,
+  reason TEXT,
+  created_ts INTEGER NOT NULL,
+  first_notice_ts INTEGER NOT NULL DEFAULT 0
+)
+""")
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS transfer_block_log (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  action TEXT NOT NULL,             -- 'block'|'manual_unblock'
+  user_id INTEGER NOT NULL,
+  until_ts INTEGER NOT NULL,
+  reason TEXT,
+  created_ts INTEGER NOT NULL,
+  from_id INTEGER DEFAULT 0,
+  to_id INTEGER DEFAULT 0,
+  amount_cents INTEGER DEFAULT 0,
+  c0 INTEGER DEFAULT 0,
+  c100k INTEGER DEFAULT 0,
+  c1m INTEGER DEFAULT 0,
   chat_id INTEGER DEFAULT 0,
   msg_id INTEGER DEFAULT 0
 )
@@ -714,7 +744,47 @@ def ensure_credit_columns():
             pass
     conn.commit()
 
-ensure_credit_columns()
+def ensure_transfer_columns():
+    for sql in [
+        "ALTER TABLE transfers ADD COLUMN fee_cents INTEGER DEFAULT 0",
+        "ALTER TABLE transfer_blocks ADD COLUMN first_notice_ts INTEGER NOT NULL DEFAULT 0",
+    ]:
+        try:
+            conn.execute(sql)
+        except sqlite3.OperationalError:
+            pass
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS transfer_blocks (
+      user_id INTEGER PRIMARY KEY,
+      until_ts INTEGER NOT NULL,
+      reason TEXT,
+      created_ts INTEGER NOT NULL,
+      first_notice_ts INTEGER NOT NULL DEFAULT 0
+    )
+    """)
+
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS transfer_block_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      action TEXT NOT NULL,
+      user_id INTEGER NOT NULL,
+      until_ts INTEGER NOT NULL,
+      reason TEXT,
+      created_ts INTEGER NOT NULL,
+      from_id INTEGER DEFAULT 0,
+      to_id INTEGER DEFAULT 0,
+      amount_cents INTEGER DEFAULT 0,
+      c0 INTEGER DEFAULT 0,
+      c100k INTEGER DEFAULT 0,
+      c1m INTEGER DEFAULT 0,
+      chat_id INTEGER DEFAULT 0,
+      msg_id INTEGER DEFAULT 0
+    )
+    """)
+    conn.commit()
+
+ensure_transfer_columns()
 
 # Runtime DB: безопасный "cur" 
 # До этого места "cur" был реальным sqlite3.Cursor и использовался для миграций/DDL.
@@ -1073,6 +1143,82 @@ def add_custom_status(uid: int, status: str) -> bool:
     )
     return True
 
+# PAY: комиссия + анти-фрод блокировка переводов
+PAY_FRAUD_WINDOW_SEC = 24 * 3600
+PAY_FRAUD_BLOCK_SEC = 24 * 3600
+
+PAY_FRAUD_BLOCK_TEXT = (
+    "Наши операторы обнаружили подозрительные переводы средств. Дабы уберечь ваши средства, мы блокируем любые переводы вашего счёта на день. Благодарим вас за понимание.\n"
+    "Сотрудник  НПАО \"Greed\" "
+)
+
+TRANSFER_BLOCK_LOG_PATH = os.path.join(DATA_DIR, "transfer_blocks.log")
+
+def get_transfer_block(uid: int) -> Tuple[int, int]:
+    """Возвращает (until_ts, first_notice_ts) для active transfer block, либо (0,0)."""
+    r = db_one(
+        "SELECT COALESCE(until_ts,0), COALESCE(first_notice_ts,0) FROM transfer_blocks WHERE user_id=?",
+        (int(uid),)
+    )
+    if not r:
+        return 0, 0
+    return int(r[0] or 0), int(r[1] or 0)
+
+def mark_transfer_block_notified(uid: int):
+    """Отмечает, что пользователю уже отправили первое уведомление о блокировке."""
+    db_exec(
+        "UPDATE transfer_blocks SET first_notice_ts=? WHERE user_id=? AND COALESCE(first_notice_ts,0)=0",
+        (now_ts(), int(uid)),
+        commit=True
+    )
+
+def log_transfer_block_file(action: str, user_id: int, until_ts: int, reason: str, *, extra: str = ""):
+    """Простое логирование в файл data/transfer_blocks.log (не критично, если упадёт)."""
+    try:
+        line = (
+            f"{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(now_ts()))}\t"
+            f"{action}\tuser={int(user_id)}\tuntil={int(until_ts)}\treason={reason or ''}\t{extra}\n"
+        )
+        with open(TRANSFER_BLOCK_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(line)
+    except Exception:
+        pass
+
+def calc_pay_fee_cents(amount_cents: int) -> int:
+    """Комиссия за /pay.
+
+    Пороговые значения заданы в долларах (храним в центах):
+    - >100_000$ -> 1%
+    - >500_000$ -> 5%
+    - >1_000_000$ -> 10% +0.1% за каждый полный следующий 1_000_000$, максимум 30%
+
+    Возвращает fee в центах.
+    """
+    amount_cents = int(amount_cents or 0)
+    if amount_cents <= 0:
+        return 0
+
+    TH_100K = 100_000 * 100
+    TH_500K = 500_000 * 100
+    TH_1M = 1_000_000 * 100
+
+    bp = 0  # basis points (1% = 100bp)
+    if amount_cents > TH_1M:
+        extra_full_millions = (amount_cents - TH_1M) // TH_1M
+        bp = 1000 + 10 * int(extra_full_millions)  # 10% + 0.1% * N
+    elif amount_cents > TH_500K:
+        bp = 500  # 5%
+    elif amount_cents > TH_100K:
+        bp = 100  # 1%
+
+    bp = min(int(bp), 3000)  # max 30%
+    if bp <= 0:
+        return 0
+
+    # округляем вверх до цента
+    return int((amount_cents * bp + 9999) // 10000)
+
+
 def transfer_balance(
     from_uid: int,
     to_uid: int,
@@ -1084,7 +1230,26 @@ def transfer_balance(
 ) -> Tuple[bool, str, int, int, int]:
     """
     Атомарный перевод денег между пользователями.
+
+    Комиссия:
+      - списывается с отправителя дополнительно (получатель получает ровно amount_cents)
+
+    Анти-фрод:
+      - если отправитель делает переводы одному и тому же получателю:
+          3 раза > 1_000_000$
+          5 раз > 100_000$
+          10 раз > 0$
+        то отправитель блокируется на 24 часа (переводы с его счёта и на его счёт).
+
     Возвращает: (ok, reason, sender_balance, receiver_balance, transfer_id)
+      reason:
+        - ok
+        - bad_amount
+        - self
+        - insufficient
+        - blocked_sender
+        - blocked_receiver
+        - error:...
     """
     from_uid = int(from_uid)
     to_uid = int(to_uid)
@@ -1099,23 +1264,109 @@ def transfer_balance(
         c = conn.cursor()
         try:
             c.execute("BEGIN")
-
-            # гарантируем строки пользователей
             ts = now_ts()
+
             c.execute("INSERT OR IGNORE INTO users (user_id, created_ts) VALUES (?,?)", (from_uid, ts))
             c.execute("INSERT OR IGNORE INTO users (user_id, created_ts) VALUES (?,?)", (to_uid, ts))
 
             c.execute("SELECT COALESCE(balance_cents,0) FROM users WHERE user_id=?", (from_uid,))
             sbal = int((c.fetchone() or [0])[0] or 0)
-            if sbal < amount_cents:
+            c.execute("SELECT COALESCE(balance_cents,0) FROM users WHERE user_id=?", (to_uid,))
+            rbal = int((c.fetchone() or [0])[0] or 0)
+
+            def _check_block(uid: int) -> int:
+                c.execute("SELECT until_ts FROM transfer_blocks WHERE user_id=?", (int(uid),))
+                rr = c.fetchone()
+                if not rr:
+                    return 0
+                until_ts = int((rr[0] if rr else 0) or 0)
+                if until_ts <= ts:
+                    c.execute("DELETE FROM transfer_blocks WHERE user_id=?", (int(uid),))
+                    return 0
+                return until_ts
+
+            from_until = _check_block(from_uid)
+            to_until = _check_block(to_uid)
+
+            if from_until > 0:
+                conn.commit()
+                return False, "blocked_sender", sbal, rbal, 0
+            if to_until > 0:
+                conn.commit()
+                return False, "blocked_receiver", sbal, rbal, 0
+
+            # анти-фрод: считаем переводы за окно времени
+            ts0 = ts - int(PAY_FRAUD_WINDOW_SEC)
+            TH_100K = 100_000 * 100
+            TH_1M = 1_000_000 * 100
+
+            c.execute(
+                """
+                SELECT
+                  COALESCE(SUM(CASE WHEN amount_cents > 0 THEN 1 ELSE 0 END),0) AS c0,
+                  COALESCE(SUM(CASE WHEN amount_cents > ? THEN 1 ELSE 0 END),0) AS c100k,
+                  COALESCE(SUM(CASE WHEN amount_cents > ? THEN 1 ELSE 0 END),0) AS c1m
+                FROM transfers
+                WHERE from_id=? AND to_id=? AND ts>=?
+                """,
+                (TH_100K, TH_1M, from_uid, to_uid, ts0)
+            )
+            row = c.fetchone() or (0, 0, 0)
+            c0 = int((row[0] if len(row) > 0 else 0) or 0)
+            c100k = int((row[1] if len(row) > 1 else 0) or 0)
+            c1m = int((row[2] if len(row) > 2 else 0) or 0)
+
+            c0_new = c0 + 1
+            c100k_new = c100k + (1 if amount_cents > TH_100K else 0)
+            c1m_new = c1m + (1 if amount_cents > TH_1M else 0)
+
+            if c1m_new >= 3 or c100k_new >= 5 or c0_new >= 10:
+                until = ts + int(PAY_FRAUD_BLOCK_SEC)
+                c.execute(
+                    "INSERT OR REPLACE INTO transfer_blocks (user_id, until_ts, reason, created_ts, first_notice_ts) VALUES (?,?,?,?,0)",
+                    (from_uid, until, "suspicious", ts)
+                )
+                
+                c.execute(
+                    "INSERT INTO transfer_block_log (action, user_id, until_ts, reason, created_ts, from_id, to_id, amount_cents, c0, c100k, c1m, chat_id, msg_id) "
+                    "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        "block",
+                        from_uid,
+                        int(until),
+                        "suspicious",
+                        int(ts),
+                        from_uid,
+                        to_uid,
+                        int(amount_cents),
+                        int(c0_new),
+                        int(c100k_new),
+                        int(c1m_new),
+                        int(chat_id or 0),
+                        int(msg_id or 0),
+                    )
+                )
+                
+                conn.commit()
+                log_transfer_block_file(
+                    "block",
+                    from_uid,
+                    int(until),
+                    "suspicious",
+                    extra=f"to={to_uid}\tamount={amount_cents}\tc0={c0_new}\tc100k={c100k_new}\tc1m={c1m_new}",
+                )
+                return False, "blocked_sender", sbal, rbal, 0
+
+            fee_cents = calc_pay_fee_cents(amount_cents)
+            total_debit = amount_cents + fee_cents
+
+            if sbal < total_debit:
                 conn.rollback()
-                c.execute("SELECT COALESCE(balance_cents,0) FROM users WHERE user_id=?", (to_uid,))
-                rbal = int((c.fetchone() or [0])[0] or 0)
                 return False, "insufficient", sbal, rbal, 0
 
             c.execute(
                 "UPDATE users SET balance_cents = COALESCE(balance_cents,0) - ? WHERE user_id=?",
-                (amount_cents, from_uid)
+                (total_debit, from_uid)
             )
             c.execute(
                 "UPDATE users SET balance_cents = COALESCE(balance_cents,0) + ? WHERE user_id=?",
@@ -1123,8 +1374,8 @@ def transfer_balance(
             )
 
             c.execute(
-                "INSERT INTO transfers (from_id, to_id, amount_cents, ts, comment, chat_id, msg_id) VALUES (?,?,?,?,?,?,?)",
-                (from_uid, to_uid, amount_cents, ts, (comment or "")[:500], int(chat_id or 0), int(msg_id or 0))
+                "INSERT INTO transfers (from_id, to_id, amount_cents, fee_cents, ts, comment, chat_id, msg_id) VALUES (?,?,?,?,?,?,?,?)",
+                (from_uid, to_uid, amount_cents, int(fee_cents), ts, (comment or "")[:500], int(chat_id or 0), int(msg_id or 0))
             )
             transfer_id = int(c.lastrowid or 0)
 
@@ -1247,7 +1498,6 @@ def _mail_letter_text(kind: str, amount_cents: int) -> str:
         d = get_user(demon_id) if demon_id else None
         dname = (d[2] if d and d[2] else "Демон")
         return (
-            "<i>Текст письма, от которого веет зловещая аура:</i>\n"
             "За всё необходимо платить по счетам. Черёд вашего попечителя получить свою долю от ваших побед.\n\n"
             f"<i>К письму прилагался отчет о вашем текущем положении. Демон <b>{html_escape(dname)}</b> стал держателем вашего \"основного актива\".</i>"
         )
@@ -3676,7 +3926,7 @@ def on_main_callbacks(call: CallbackQuery):
             "Список команд модерирования\n"
             "☛ профиль /profile\n"
             "Статусы ☚\n"
-            "☛ кастомный /addstatus"
+            "☛ кастомный /addstatus\n"
             "☛ демон /devil\n"
             "☛ человек /human\n"
             "☛ удалить раба /delrab\n"
@@ -3687,6 +3937,7 @@ def on_main_callbacks(call: CallbackQuery):
             "ㅤфинансы ☚\n"
             "ㅤ☛ выдать /finance\n"
             "ㅤ☛ забрать /take\n"
+            "ㅤ☛ разблокировка /udblockcash\n"
             "☛ работа /work"
         )
 
@@ -6635,6 +6886,86 @@ def cmd_delstat(message):
     free_slave_fully(target_id, "Администратор снял статус раба")
     bot.reply_to(message, f"Готово. Статус раба снят с @{uname}.")
 
+@bot.message_handler(commands=["udblockcash"])
+def cmd_udblockcash(message):
+    if message.from_user.id != OWNER_ID:
+        return
+    if message.chat.type != "private":
+        return
+
+    parts = (message.text or "").split(maxsplit=1)
+
+    target_id: Optional[int] = None
+    if len(parts) >= 2 and parts[1].strip():
+        target_id = resolve_user_id_ref(parts[1].strip())
+    elif message.reply_to_message:
+        target_user = message.reply_to_message.from_user
+        target_id = int(target_user.id)
+        upsert_user(target_id, getattr(target_user, "username", None))
+    else:
+        bot.reply_to(message, "Использование: /udblockcash @username|user_id (или ответом на сообщение)")
+        return
+
+    if not target_id:
+        bot.reply_to(message, "Пользователь не найден в базе. Используйте @username или user_id.")
+        return
+
+    until_ts = 0
+    reason = ""
+    with DB_LOCK:
+        c = conn.cursor()
+        try:
+            c.execute("BEGIN")
+            c.execute("SELECT until_ts, reason FROM transfer_blocks WHERE user_id=?", (int(target_id),))
+            rr = c.fetchone()
+            if not rr:
+                conn.commit()
+                bot.reply_to(message, "У пользователя нет активной блокировки переводов.")
+                return
+
+            until_ts = int((rr[0] if rr else 0) or 0)
+            reason = str((rr[1] if rr else "") or "")
+
+            c.execute("DELETE FROM transfer_blocks WHERE user_id=?", (int(target_id),))
+
+            c.execute(
+                "INSERT INTO transfer_block_log (action, user_id, until_ts, reason, created_ts, chat_id, msg_id) "
+                "VALUES (?,?,?,?,?,?,?)",
+                ("manual_unblock", int(target_id), int(until_ts), (reason or "")[:200], now_ts(), int(message.chat.id), int(message.message_id))
+            )
+
+            conn.commit()
+        except Exception as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            bot.reply_to(message, f"Ошибка разблокировки: {e}")
+            return
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
+
+    log_transfer_block_file("manual_unblock", int(target_id), int(until_ts), reason, extra=f"by={message.from_user.id}")
+
+    tu = get_user(int(target_id))
+    tname = (tu[2] if tu and tu[2] else "Пользователь")
+    tun = (tu[1] if tu and tu[1] else "") or ""
+    tun_part = f" (@{html_escape(tun)})" if tun else ""
+
+    bot.reply_to(
+        message,
+        f"Готово. Блокировка переводов снята с <b>{html_escape(tname)}</b>{tun_part}.",
+        parse_mode="HTML"
+    )
+
+    try:
+        bot.send_message(int(target_id), "С вашего счёта снята блокировка переводов средств.", parse_mode="HTML")
+    except Exception:
+        pass
+
 @bot.message_handler(commands=["del"])
 def cmd_del(message):
     if message.from_user.id != OWNER_ID:
@@ -6813,7 +7144,6 @@ def cmd_pay(message):
     upsert_user(sender_id, sender_un)
 
     if not is_registered(sender_id):
-        bot.reply_to(message, "Сначала подпишите контракт через /start.")
         return
 
     raw = (message.text or "").strip()
@@ -6830,12 +7160,12 @@ def cmd_pay(message):
         amount_str = parts[1]
         comment = parts[2] if len(parts) >= 3 else ""
     else:
-        # вариант: /pay @username сумма [комментарий]
         if len(parts) < 3:
             bot.reply_to(
                 message,
-                "Использование: /pay @username сумма [комментарий]\n"
-                "или ответом на сообщение: /pay сумма [комментарий]"
+                "Приветсвуем вас в системе быстрых переводов средств НПАО \"Greed\""
+                "Чтобы воспользоваться услугой, введите: /pay @username сумма [комментарий]\n"
+                "Поддержка перевода по NFS! Достаточно ответить на чужое сообщение и ввести: /pay сумма [комментарий]"
             )
             return
 
@@ -6847,7 +7177,7 @@ def cmd_pay(message):
         target_un = target_ref[1:].strip()
         rr = db_one("SELECT user_id FROM users WHERE username=? COLLATE NOCASE", (target_un,))
         if not rr:
-            bot.reply_to(message, "Пользователь не найден в базе. Пусть сначала напишет боту /start.")
+            bot.reply_to(message, "Пользователь не найден в базе данных нашей организации :(")
             return
 
         target_id = int(rr[0])
@@ -6859,6 +7189,8 @@ def cmd_pay(message):
         bot.reply_to(message, "Неверная сумма.")
         return
 
+    fee = calc_pay_fee_cents(int(amt))
+
     ok, reason, sbal, rbal, _tid = transfer_balance(
         sender_id, int(target_id), int(amt),
         comment=comment,
@@ -6868,11 +7200,43 @@ def cmd_pay(message):
 
     if not ok:
         if reason == "insufficient":
-            bot.reply_to(message, f"Недостаточно средств. Ваш баланс: {cents_to_money_str(int(sbal))}$")
+            if fee > 0:
+                bot.reply_to(
+                    message,
+                    f"Недостаточно средств на перевод.\n"
+                    f"К переводу: {cents_to_money_str(int(amt))}$\n"
+                    f"Комиссия: {cents_to_money_str(int(fee))}$\n"
+                    f"К списанию: {cents_to_money_str(int(amt) + int(fee))}$\n"
+                    f"Ваш баланс: {cents_to_money_str(int(sbal))}$"
+                )
+            else:
+                bot.reply_to(message, f"Недостаточно средств на вашем балансе: {cents_to_money_str(int(sbal))}$")
             return
         if reason == "self":
-            bot.reply_to(message, "Нельзя переводить деньги самому себе.")
             return
+        
+        if reason == "blocked_sender":
+            until_ts, first_notice_ts = get_transfer_block(sender_id)
+            if int(first_notice_ts or 0) <= 0:
+                bot.reply_to(message, PAY_FRAUD_BLOCK_TEXT)
+                mark_transfer_block_notified(sender_id)
+            else:
+                if int(until_ts or 0) > 0:
+                    until_txt = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(int(until_ts)))
+                    left = max(0, int(until_ts) - now_ts())
+                    bot.reply_to(
+                        message,
+                        f"Ваш счёт временно недоступен. Примерное время ожидания <b>{until_txt}</b> (через {_format_duration(left)}).",
+                        parse_mode="HTML"
+                    )
+                else:
+                    bot.reply_to(message, "Переводы временно заблокированы. Попробуйте позже.")
+            return
+
+        if reason == "blocked_receiver":
+            bot.reply_to(message, "Переводы на счёт этого пользователя временно недоступны.")
+            return
+
         bot.reply_to(message, "Не удалось выполнить перевод. Попробуйте позже.")
         return
 
@@ -6886,10 +7250,19 @@ def cmd_pay(message):
     tun = (tu[1] if tu and tu[1] else "") or ""
     tun_part = f" (@{html_escape(tun)})" if tun else ""
 
+    fee_lines = ""
+    if fee > 0:
+        fee_lines = (
+            f"\nКомиссия за перевод <b>{cents_to_money_str(int(fee))}</b>$"
+            f"\nИтоговое списание: <b>{cents_to_money_str(int(amt) + int(fee))}</b>$"
+        )
+
     bot.reply_to(
         message,
-        f"Перевод выполнен: <b>{cents_to_money_str(int(amt))}</b>$ → <b>{html_escape(tname)}</b>{tun_part}\n"
-        f"Ваш баланс: <b>{cents_to_money_str(int(sbal))}</b>$",
+        f"Перевод выполнен: <b>{cents_to_money_str(int(amt))}</b>$ → <b>{html_escape(tname)}</b>{tun_part}"
+        f"{fee_lines}\n"
+        f"Ваш баланс: <b>{cents_to_money_str(int(sbal))}</b>$"
+        "Благодарим за пользование услугами перевода! Ваш НПАО \"Greed\"",
         parse_mode="HTML"
     )
 
@@ -6897,7 +7270,8 @@ def cmd_pay(message):
         bot.send_message(
             int(target_id),
             f"Вам перевели <b>{cents_to_money_str(int(amt))}</b>$ от <b>{html_escape(sname)}</b>{sun_part}.\n"
-            f"Ваш баланс: <b>{cents_to_money_str(int(rbal))}</b>$",
+            f"Ваш баланс: <b>{cents_to_money_str(int(rbal))}</b>$"
+            "Ваш НПАО \"Greed\"",
             parse_mode="HTML"
         )
     except Exception:
@@ -6919,7 +7293,7 @@ def cmd_rabs(message):
     owner_un = parts[1][1:].strip()
     rr = db_one("SELECT user_id, short_name, username FROM users WHERE username=? COLLATE NOCASE", (owner_un,))
     if not rr:
-        bot.reply_to(message, "Пользователь не найден в базе.")
+        bot.reply_to(message, "Пользователь не найден.")
         return
 
     owner_id = int(rr[0])
@@ -7044,7 +7418,7 @@ def cmd_buyrab(message):
     if buyer_bal < total_cents or buyer_bal < 0:
         bot.reply_to(
             message,
-            f"Недостаточно средств. Нужно: {cents_to_money_str(total_cents)}$, на балансе: {cents_to_money_str(buyer_bal)}$.",
+            f"Недостаточно средств для приобретения. Нужно: {cents_to_money_str(total_cents)}$, на балансе: {cents_to_money_str(buyer_bal)}$.",
         )
         return
 
@@ -7259,9 +7633,10 @@ def cmd_buy(message):
     buyer_name = (buyer_u[2] if buyer_u and buyer_u[2] else "Игрок")
     buyer_un = (buyer_u[1] if buyer_u and buyer_u[1] else None)
     buyer_tag = f"@{buyer_un}" if buyer_un else html_escape(buyer_name)
+    rand = random.randint(1000000, 9999999)
 
     text = (
-        f"Предложение о выкупе раба\n\n"
+        f"Предложение о выкупе раба №{rand}\n\n"
         f"Раб: <b>{html_escape(slave_name)}</b> (@{html_escape(slave_un)})\n"
         f"Покупатель: <b>{html_escape(buyer_tag)}</b>\n"
         f"Предлагаемая цена выкупа: <b>{cents_to_money_str(price_cents)}</b>$\n\n"
