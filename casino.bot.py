@@ -3938,6 +3938,7 @@ def on_main_callbacks(call: CallbackQuery):
             "ㅤ☛ выдать /finance\n"
             "ㅤ☛ забрать /take\n"
             "ㅤ☛ разблокировка /udblockcash\n"
+            "ㅤ☛ блокировка /blockcash\n"
             "☛ работа /work"
         )
 
