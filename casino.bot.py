@@ -767,7 +767,7 @@ def ensure_transfer_columns():
     conn.execute("""
     CREATE TABLE IF NOT EXISTS transfer_block_log (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
-      action TEXT NOT NULL,
+      action TEXT NOT NULL,             -- 'block'|'manual_block'|'manual_unblock'
       user_id INTEGER NOT NULL,
       until_ts INTEGER NOT NULL,
       reason TEXT,
@@ -1149,20 +1149,20 @@ PAY_FRAUD_BLOCK_SEC = 24 * 3600
 
 PAY_FRAUD_BLOCK_TEXT = (
     "Наши операторы обнаружили подозрительные переводы средств. Дабы уберечь ваши средства, мы блокируем любые переводы вашего счёта на день. Благодарим вас за понимание.\n"
-    "Сотрудник  НПАО \"Greed\" "
+    "Сотрудник  НПАО \"Greed\""
 )
 
 TRANSFER_BLOCK_LOG_PATH = os.path.join(DATA_DIR, "transfer_blocks.log")
 
-def get_transfer_block(uid: int) -> Tuple[int, int]:
-    """Возвращает (until_ts, first_notice_ts) для active transfer block, либо (0,0)."""
+def get_transfer_block(uid: int) -> Tuple[int, int, str]:
+    """Возвращает (until_ts, first_notice_ts, reason) для активной блокировки, либо (0,0,'')."""
     r = db_one(
-        "SELECT COALESCE(until_ts,0), COALESCE(first_notice_ts,0) FROM transfer_blocks WHERE user_id=?",
+        "SELECT COALESCE(until_ts,0), COALESCE(first_notice_ts,0), COALESCE(reason,'') FROM transfer_blocks WHERE user_id=?",
         (int(uid),)
     )
     if not r:
-        return 0, 0
-    return int(r[0] or 0), int(r[1] or 0)
+        return 0, 0, ""
+    return int(r[0] or 0), int(r[1] or 0), str(r[2] or "")
 
 def mark_transfer_block_notified(uid: int):
     """Отмечает, что пользователю уже отправили первое уведомление о блокировке."""
@@ -1323,7 +1323,7 @@ def transfer_balance(
             if c1m_new >= 3 or c100k_new >= 5 or c0_new >= 10:
                 until = ts + int(PAY_FRAUD_BLOCK_SEC)
                 c.execute(
-                    "INSERT OR REPLACE INTO transfer_blocks (user_id, until_ts, reason, created_ts, first_notice_ts) VALUES (?,?,?,?,0)",
+                    "INSERT OR REPLACE INTO transfer_blocks (user_id, until_ts, reason, created_ts, first_notice_ts) VALUES (?,?,?,?,0)"
                     (from_uid, until, "suspicious", ts)
                 )
                 
@@ -6808,13 +6808,15 @@ def cmd_work(message):
     if message.chat.type != "private":
         return
 
-    parts = message.text.split()
+    parts = (message.text or "").split(maxsplit=2)
     if len(parts) < 2 or not parts[1].startswith("@"):
-        bot.reply_to(message, "Использование: /work @username")
+        bot.reply_to(message, "Использование: /work @username [вакансия]")
         return
-    uname = parts[1][1:].strip()
 
-    r = db_one("SELECT user_id FROM users WHERE username=?", (uname,))
+    uname = parts[1][1:].strip()
+    job_query = parts[2].strip() if len(parts) >= 3 else ""
+
+    r = db_one("SELECT user_id FROM users WHERE username=? COLLATE NOCASE", (uname,))
     if not r:
         bot.reply_to(message, "Пользователь не найден в базе.")
         return
@@ -6825,40 +6827,52 @@ def cmd_work(message):
         bot.reply_to(message, "У пользователя нет анкеты (не введено имя).")
         return
 
-    cur_shift = db_one(
-        "SELECT user_id, job_key, started_ts, ends_ts, salary_full_cents, success_pct FROM work_shift WHERE user_id=?",
-        (uid,)
-    )
+    cur_shift = get_current_shift(uid)
     if cur_shift:
-        ends_ts = int(cur_shift[3] or 0)
-        bot.reply_to(message, f"Пользователь уже работает. Вернётся через {_format_duration(max(0, ends_ts - now_ts()))}.")
-        return
+        ends_ts0 = int(cur_shift[3] or 0)
+        if ends_ts0 > now_ts():
+            bot.reply_to(message, f"Пользователь уже работает. Вернётся через {_format_duration(max(0, ends_ts0 - now_ts()))}.")
+            return
+        db_exec("DELETE FROM work_shift WHERE user_id=?", (uid,), commit=True)
 
     jobs = load_jobs()
     if not jobs:
         bot.reply_to(message, "Список вакансий пуст (файл работ не загружен).")
         return
 
-    job_key = list(jobs.keys())[0]
-    shifts, days, earned = get_work_stats(uid, job_key)
-    salary_full = _salary_with_seniority(jobs[job_key], days)
-    ends_ts = now_ts() + int(jobs[job_key].hours) * 3600
+    job_key: Optional[str] = None
+    if job_query:
+        q = job_query.strip().lower()
+        qn = _normalize_job_key(job_query)
 
-    db_exec("""
-    INSERT INTO work_shift (user_id, job_key, started_ts, ends_ts, salary_full_cents, success_pct)
-    VALUES (?,?,?,?,?,?)
-    ON CONFLICT(user_id) DO UPDATE SET
-      job_key=excluded.job_key,
-      started_ts=excluded.started_ts,
-      ends_ts=excluded.ends_ts,
-      salary_full_cents=excluded.salary_full_cents,
-      success_pct=excluded.success_pct
-    """, (uid, job_key, now_ts(), ends_ts, int(salary_full), int(jobs[job_key].success_pct)), commit=True)
+        if q in jobs:
+            job_key = q
+        elif qn in jobs:
+            job_key = qn
+        else:
+            for jk, jb in jobs.items():
+                title_l = (jb.title or "").lower()
+                if q in title_l or qn == _normalize_job_key(jb.title):
+                    job_key = jk
+                    break
+
+        if not job_key:
+            lst = "\n".join([f"• {j.title} (ключ: {k})" for k, j in jobs.items()])
+            bot.reply_to(message, "Вакансия не найдена. Доступные вакансии:\n" + lst)
+            return
+    else:
+        job_key = list(jobs.keys())[0]
+
+    ends_ts, _salary_full = start_shift(uid, job_key)
 
     bot.reply_to(message, f"Пользователь @{uname} отправлен на работу: {jobs[job_key].title} (до {time.strftime('%H:%M:%S', time.localtime(ends_ts))})")
 
     try:
-        bot.send_message(uid, f"Вас отправили на работу: <b>{html_escape(jobs[job_key].title)}</b>\nВернётесь через {_format_duration(ends_ts - now_ts())}.", parse_mode="HTML")
+        bot.send_message(
+            uid,
+            f"Вас \"добровольно\" отправили на работу по вокансии <b>{html_escape(jobs[job_key].title)}</b>\nВернётесь через {_format_duration(max(0, ends_ts - now_ts()))}.",
+            parse_mode="HTML"
+        )
     except Exception:
         pass
 
@@ -6885,6 +6899,104 @@ def cmd_delstat(message):
 
     free_slave_fully(target_id, "Администратор снял статус раба")
     bot.reply_to(message, f"Готово. Статус раба снят с @{uname}.")
+
+@bot.message_handler(commands=["blockcash"])
+def cmd_blockcash(message):
+    if message.from_user.id != OWNER_ID:
+        return
+    if message.chat.type != "private":
+        return
+
+    raw = (message.text or "").strip()
+    parts = raw.split(maxsplit=2)
+
+    target_id: Optional[int] = None
+    dur_spec = ""
+
+    # /blockcash @username 24h
+    if len(parts) >= 2 and (parts[1].startswith("@") or parts[1].isdigit()):
+        target_id = resolve_user_id_ref(parts[1].strip())
+        dur_spec = parts[2].strip() if len(parts) >= 3 else ""
+    # ответом: /blockcash 24h
+    elif message.reply_to_message and len(parts) >= 2:
+        target_user = message.reply_to_message.from_user
+        target_id = int(target_user.id)
+        upsert_user(target_id, getattr(target_user, "username", None))
+        dur_spec = parts[1].strip()
+
+    if not target_id or not dur_spec:
+        bot.reply_to(message, "Использование: /blockcash @username|user_id 24h\nили ответом на сообщение: /blockcash 24h")
+        return
+
+    m = re.fullmatch(r"(?i)\s*(\d+)\s*([smhd])\s*", dur_spec)
+    if not m:
+        bot.reply_to(message, "Неверная длительность. Примеры: 30m, 6h, 24h, 2d")
+        return
+
+    n = int(m.group(1))
+    unit = m.group(2).lower()
+    mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}.get(unit, 0)
+    sec = n * mult
+    if sec <= 0:
+        bot.reply_to(message, "Неверная длительность.")
+        return
+
+    # максимум 30 дней
+    sec = min(sec, 30 * 86400)
+
+    ts = now_ts()
+    until_ts = ts + int(sec)
+
+    with DB_LOCK:
+        c = conn.cursor()
+        try:
+            c.execute("BEGIN")
+            c.execute(
+                "INSERT OR REPLACE INTO transfer_blocks (user_id, until_ts, reason, created_ts, first_notice_ts) VALUES (?,?,?,?,?)",
+                (int(target_id), int(until_ts), "manual", int(ts), int(ts))
+            )
+            c.execute(
+                "INSERT INTO transfer_block_log (action, user_id, until_ts, reason, created_ts, chat_id, msg_id) VALUES (?,?,?,?,?,?,?)",
+                ("manual_block", int(target_id), int(until_ts), "manual", int(ts), int(message.chat.id), int(message.message_id))
+            )
+            conn.commit()
+        except Exception as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            bot.reply_to(message, f"Ошибка блокировки: {e}")
+            return
+        finally:
+            try:
+                c.close()
+            except Exception:
+                pass
+
+    log_transfer_block_file("manual_block", int(target_id), int(until_ts), "manual", extra=f"by={message.from_user.id}")
+
+    until_txt = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(int(until_ts)))
+    left = max(0, int(until_ts) - now_ts())
+
+    tu = get_user(int(target_id))
+    tname = (tu[2] if tu and tu[2] else "Пользователь")
+    tun = (tu[1] if tu and tu[1] else "") or ""
+    tun_part = f" (@{html_escape(tun)})" if tun else ""
+
+    bot.reply_to(
+        message,
+        f"Готово. Переводы заблокированы для <b>{html_escape(tname)}</b>{tun_part} до <b>{until_txt}</b> (через {_format_duration(left)}).",
+        parse_mode="HTML"
+    )
+
+    try:
+        bot.send_message(
+            int(target_id),
+            f"Ваш счёт принудительно временно недоступен. Блокировка переводов истечёт через <b>{_format_duration(left)}</b> ({until_txt}). Сотрудник  НПАО \"Greed\"",
+            parse_mode="HTML"
+        )
+    except Exception:
+        pass
 
 @bot.message_handler(commands=["udblockcash"])
 def cmd_udblockcash(message):
@@ -6929,8 +7041,7 @@ def cmd_udblockcash(message):
             c.execute("DELETE FROM transfer_blocks WHERE user_id=?", (int(target_id),))
 
             c.execute(
-                "INSERT INTO transfer_block_log (action, user_id, until_ts, reason, created_ts, chat_id, msg_id) "
-                "VALUES (?,?,?,?,?,?,?)",
+                "INSERT INTO transfer_block_log (action, user_id, until_ts, reason, created_ts, chat_id, msg_id) VALUES (?,?,?,?,?,?,?)",
                 ("manual_unblock", int(target_id), int(until_ts), (reason or "")[:200], now_ts(), int(message.chat.id), int(message.message_id))
             )
 
@@ -6955,14 +7066,10 @@ def cmd_udblockcash(message):
     tun = (tu[1] if tu and tu[1] else "") or ""
     tun_part = f" (@{html_escape(tun)})" if tun else ""
 
-    bot.reply_to(
-        message,
-        f"Готово. Блокировка переводов снята с <b>{html_escape(tname)}</b>{tun_part}.",
-        parse_mode="HTML"
-    )
+    bot.reply_to(message, f"Готово. Блокировка переводов снята с <b>{html_escape(tname)}</b>{tun_part}.", parse_mode="HTML")
 
     try:
-        bot.send_message(int(target_id), "С вашего счёта снята блокировка переводов средств.", parse_mode="HTML")
+        bot.send_message(int(target_id), "С вашего счёта снята блокировка переводов средств. Благодарим вас за оидание. Ваш НПАО \"Greed\"", parse_mode="HTML")
     except Exception:
         pass
 
@@ -7158,7 +7265,7 @@ def cmd_pay(message):
         target_id = int(target_user.id)
         upsert_user(target_id, getattr(target_user, "username", None))
         amount_str = parts[1]
-        comment = parts[2] if len(parts) >= 3 else ""
+        comment = " ".join(parts[2:]).strip() if len(parts) >= 3 else ""
     else:
         if len(parts) < 3:
             bot.reply_to(
@@ -7216,8 +7323,9 @@ def cmd_pay(message):
             return
         
         if reason == "blocked_sender":
-            until_ts, first_notice_ts = get_transfer_block(sender_id)
-            if int(first_notice_ts or 0) <= 0:
+            until_ts, first_notice_ts, b_reason = get_transfer_block(sender_id)
+        
+            if int(first_notice_ts or 0) <= 0 and (b_reason or "") == "suspicious":
                 bot.reply_to(message, PAY_FRAUD_BLOCK_TEXT)
                 mark_transfer_block_notified(sender_id)
             else:
@@ -7226,7 +7334,7 @@ def cmd_pay(message):
                     left = max(0, int(until_ts) - now_ts())
                     bot.reply_to(
                         message,
-                        f"Ваш счёт временно недоступен. Примерное время ожидания <b>{until_txt}</b> (через {_format_duration(left)}).",
+                        f"Ваш счёт временно недоступен. Примерное время ожидания <b>{until_txt}</b> (через {_format_duration(left)}). Благодарим вас за понимание. Ваш НПАО \"Greed\"",
                         parse_mode="HTML"
                     )
                 else:
@@ -7257,12 +7365,17 @@ def cmd_pay(message):
             f"\nИтоговое списание: <b>{cents_to_money_str(int(amt) + int(fee))}</b>$"
         )
 
+    comment_clean = (comment or "").strip()
+    if len(comment_clean) > 240:
+        comment_clean = comment_clean[:240] + "…"
+    comment_line = f"\nКомментарий к переводу: <i>{html_escape(comment_clean)}</i>" if comment_clean else ""
+    
     bot.reply_to(
         message,
         f"Перевод выполнен: <b>{cents_to_money_str(int(amt))}</b>$ → <b>{html_escape(tname)}</b>{tun_part}"
         f"{fee_lines}\n"
-        f"Ваш баланс: <b>{cents_to_money_str(int(sbal))}</b>$"
-        "Благодарим за пользование услугами перевода! Ваш НПАО \"Greed\"",
+        f"Ваш баланс: <b>{cents_to_money_str(int(sbal))}</b>$\n"
+        "Благодарим за пользование услугами перевода КО НПАО \"Greed\"",
         parse_mode="HTML"
     )
 
@@ -7270,7 +7383,8 @@ def cmd_pay(message):
         bot.send_message(
             int(target_id),
             f"Вам перевели <b>{cents_to_money_str(int(amt))}</b>$ от <b>{html_escape(sname)}</b>{sun_part}.\n"
-            f"Ваш баланс: <b>{cents_to_money_str(int(rbal))}</b>$"
+            f"Ваш баланс: <b>{cents_to_money_str(int(rbal))}</b>$\n"
+            f"{comment_line}\n"
             "Ваш НПАО \"Greed\"",
             parse_mode="HTML"
         )
