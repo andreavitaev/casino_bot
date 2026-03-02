@@ -78,6 +78,10 @@ def send_error_report(context: str, exc: Exception | None = None) -> None:
         if (now - prev) < ERROR_REPORT_COOLDOWN_SEC:
             return
         _ERROR_REPORT_LAST[context] = now
+        try:
+            remember_last_error(context)
+        except Exception:
+            pass       
 
         if exc is None:
             tb = traceback.format_exc()
@@ -932,6 +936,22 @@ CREATE TABLE IF NOT EXISTS pm_trade_state (
 )
 """)
 
+cur.execute("""
+CREATE TABLE IF NOT EXISTS bot_admins (
+  user_id INTEGER PRIMARY KEY,
+  added_ts INTEGER NOT NULL DEFAULT 0,
+  added_by INTEGER NOT NULL DEFAULT 0
+)
+""")
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS bot_state (
+  key TEXT PRIMARY KEY,
+  value TEXT NOT NULL DEFAULT '',
+  updated_ts INTEGER NOT NULL DEFAULT 0
+)
+""")
+
 conn.commit()
 
 def ensure_game_origin_columns():
@@ -1336,6 +1356,349 @@ def remember_group_chat(chat_id: int, title: str = "") -> None:
 def forget_group_chat(chat_id: int) -> None:
     db_exec("DELETE FROM known_group_chats WHERE chat_id=?", (int(chat_id),), commit=True)
 
+# BOT ADMINS + MAINTENANCE MODE
+
+def is_owner(uid: int) -> bool:
+    return int(uid) == int(OWNER_ID)
+
+def is_bot_admin(uid: int) -> bool:
+    uid = int(uid or 0)
+    if uid == int(OWNER_ID):
+        return True
+    try:
+        r = db_one("SELECT 1 FROM bot_admins WHERE user_id=? LIMIT 1", (uid,))
+        return bool(r)
+    except Exception:
+        return False
+
+def set_bot_admin(uid: int, enabled: bool, by_id: int = 0) -> None:
+    uid = int(uid or 0)
+    by_id = int(by_id or 0)
+    if uid <= 0:
+        return
+
+    if enabled:
+        db_exec(
+            "INSERT OR IGNORE INTO bot_admins (user_id, added_ts, added_by) VALUES (?,?,?)",
+            (uid, now_ts(), by_id),
+            commit=True
+        )
+        # видимый статус
+        try:
+            add_custom_status(uid, "Бот-админ")
+        except Exception:
+            pass
+    else:
+        db_exec("DELETE FROM bot_admins WHERE user_id=?", (uid,), commit=True)
+        try:
+            db_exec(
+                "DELETE FROM user_custom_status WHERE user_id=? AND status=?",
+                (uid, "Бот-админ"),
+                commit=True
+            )
+        except Exception:
+            pass
+
+def bot_state_get(key: str, default: str = "") -> str:
+    key = str(key or "").strip()
+    if not key:
+        return default
+    try:
+        r = db_one("SELECT value FROM bot_state WHERE key=?", (key,))
+        if not r:
+            return default
+        return str(r[0] or "")
+    except Exception:
+        return default
+
+def bot_state_set(key: str, value: str) -> None:
+    key = str(key or "").strip()
+    if not key:
+        return
+    db_exec(
+        "INSERT INTO bot_state (key, value, updated_ts) VALUES (?,?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_ts=excluded.updated_ts",
+        (key, str(value or ""), now_ts()),
+        commit=True
+    )
+
+_SLEEP_CACHE: dict = {"ts": 0, "sleeping": False, "mode": "", "reason": "", "last_err": ""}
+
+def get_last_error_code() -> str:
+    try:
+        ctx = (bot_state_get("last_error_ctx", "") or "").strip()
+        if not ctx:
+            return ""
+        seq = (bot_state_get("error_seq", "") or "").strip()
+        ts = (bot_state_get("last_error_ts", "") or "").strip()
+
+        pref = f"E{seq}: " if seq.isdigit() else ""
+        ttxt = ""
+        if ts.isdigit():
+            try:
+                ttxt = _fmt_ts(int(ts))
+            except Exception:
+                ttxt = ""
+
+        if ttxt:
+            return f"{pref}{ctx} ({ttxt})"
+        return f"{pref}{ctx}"
+    except Exception:
+        return ""
+
+def remember_last_error(context: str) -> None:
+    context = (context or "").strip()
+    if not context:
+        return
+    try:
+        seq = int(bot_state_get("error_seq", "0") or 0) + 1
+    except Exception:
+        seq = 1
+    try:
+        bot_state_set("error_seq", str(seq))
+        bot_state_set("last_error_ctx", context[:200])
+        bot_state_set("last_error_ts", str(now_ts()))
+        _SLEEP_CACHE["ts"] = 0
+    except Exception:
+        pass
+
+def get_bot_sleep_state() -> Tuple[bool, str, str, str]:
+    now = now_ts()
+    try:
+        if (now - int(_SLEEP_CACHE.get("ts", 0) or 0)) < 2:
+            return (
+                bool(_SLEEP_CACHE.get("sleeping")),
+                str(_SLEEP_CACHE.get("mode", "") or ""),
+                str(_SLEEP_CACHE.get("reason", "") or ""),
+                str(_SLEEP_CACHE.get("last_err", "") or ""),
+            )
+    except Exception:
+        pass
+
+    sleeping = (bot_state_get("sleeping", "0") == "1")
+    mode = bot_state_get("sleep_mode", "")
+    reason = bot_state_get("sleep_reason", "")
+    last_err = get_last_error_code()
+
+    _SLEEP_CACHE.update({
+        "ts": now,
+        "sleeping": sleeping,
+        "mode": mode,
+        "reason": reason,
+        "last_err": last_err
+    })
+    return sleeping, mode, reason, last_err
+
+def set_bot_sleep(mode: str, reason: str = "") -> None:
+    bot_state_set("sleeping", "1")
+    bot_state_set("sleep_mode", (mode or "").strip().lower())
+    bot_state_set("sleep_reason", (reason or "").strip())
+    _SLEEP_CACHE["ts"] = 0
+
+def clear_bot_sleep() -> None:
+    bot_state_set("sleeping", "0")
+    bot_state_set("sleep_mode", "")
+    bot_state_set("sleep_reason", "")
+    _SLEEP_CACHE["ts"] = 0
+
+def build_sleep_notice_text() -> str:
+    sleeping, mode, reason, last_err = get_bot_sleep_state()
+    if not sleeping:
+        return ""
+
+    mode = (mode or "").strip().lower()
+    reason = (reason or "").strip()
+
+    if mode == "update":
+        return (
+            "🛠️🤖 Внимание. Проводятся сложные технические работы обновления версии.\n"
+            "Дабы не омрачить ваш опыт пользования ботом, на время технических работ все функции бота будут отключены до непосредственного выхода обновления.\n"
+            "Благодарю за понимание. Администратор."
+        )
+
+    err_txt = (last_err or "").strip() or "-"
+    base = (
+        "<b>⚠️Внимание!</b>\n"
+        "В связи с технической ошибкой и/или неисправностью, бот переходит в аварийный режим.\n"
+        "<u>Все функции бота (игры, статистика, транзакции) будут ОТКЛЮЧЕНЫ до их частичного или полного урегулирования.</u>\n"
+        "Благодарю за понимание. Администратор."
+    )
+    return base + "\n" + f"<code>{html_escape(err_txt)}</code>"
+
+def bot_status_human() -> str:
+    sleeping, mode, _reason, last_err = get_bot_sleep_state()
+    if not sleeping:
+        return "ON ✅"
+    mode = (mode or "").strip().lower()
+    if mode == "update":
+        return "OFF 🛠️ (update)"
+    # error
+    if last_err:
+        return f"OFF ⚠️ (error) — {last_err}"
+    return "OFF ⚠️ (error)"
+
+_SLEEP_NOTICE_LAST: Dict[Tuple[int, int], int] = {}
+
+def _sleep_notice_cooldown_ok(chat_id: int, user_id: int, sec: int = 30) -> bool:
+    chat_id = int(chat_id or 0)
+    user_id = int(user_id or 0)
+    key = (chat_id, user_id)
+    now = now_ts()
+    prev = int(_SLEEP_NOTICE_LAST.get(key, 0) or 0)
+    if (now - prev) < int(sec):
+        return False
+    _SLEEP_NOTICE_LAST[key] = now
+    return True
+
+def _allow_message_during_sleep(message) -> bool:
+    try:
+        uid = int(getattr(getattr(message, "from_user", None), "id", 0) or 0)
+    except Exception:
+        uid = 0
+
+    if is_bot_admin(uid):
+        return True
+
+    try:
+        txt = str(getattr(message, "text", "") or "")
+    except Exception:
+        txt = ""
+
+    txt = txt.strip()
+    if txt.startswith("/report"):
+        return True
+
+    return False
+
+def _allow_callback_during_sleep(call: CallbackQuery) -> bool:
+    try:
+        uid = int(getattr(getattr(call, "from_user", None), "id", 0) or 0)
+    except Exception:
+        uid = 0
+
+    if is_bot_admin(uid):
+        return True
+
+    try:
+        data = str(getattr(call, "data", "") or "")
+    except Exception:
+        data = ""
+
+    if data.startswith("report:"):
+        return True
+
+    return False
+
+def _parse_retry_after(exc: Exception) -> float:
+    s = str(exc)
+    m = re.search(r"retry after (\d+(?:\.\d+)?)", s, re.IGNORECASE)
+    if m:
+        try:
+            return float(m.group(1))
+        except Exception:
+            return 0.0
+    return 0.0
+
+def send_message_with_retry(chat_id: int, text: str, parse_mode: str = "HTML") -> bool:
+    try:
+        bot.send_message(int(chat_id), text, parse_mode=parse_mode)
+        return True
+    except Exception as e:
+        ra = _parse_retry_after(e)
+        if ra and ra > 0:
+            time.sleep(ra + 0.2)
+            try:
+                bot.send_message(int(chat_id), text, parse_mode=parse_mode)
+                return True
+            except Exception:
+                return False
+        return False
+
+def broadcast_notice(body: str, respect_pm_settings: bool = True) -> Dict[str, int]:
+    rows = db_all("SELECT user_id FROM users WHERE COALESCE(contract_ts,0) > 0 ORDER BY user_id", ()) or []
+    uids = [int(r[0]) for r in rows if r and int(r[0] or 0) > 0]
+    if not uids:
+        return {"groups_sent": 0, "groups_failed": 0, "pm_sent": 0, "pm_failed": 0, "pm_skipped": 0, "covered": 0, "groups_checked": 0}
+
+    group_sent = 0
+    group_failed = 0
+    group_checked = 0
+    covered_uids: set[int] = set()
+
+    bot_me_id = 0
+    try:
+        if ME:
+            bot_me_id = int(getattr(ME, "id", 0) or 0)
+    except Exception:
+        bot_me_id = 0
+    if bot_me_id <= 0:
+        try:
+            me = bot.get_me()
+            bot_me_id = int(getattr(me, "id", 0) or 0)
+        except Exception:
+            bot_me_id = 0
+
+    group_ids = get_known_broadcast_group_ids()
+    for chat_id in group_ids:
+        group_checked += 1
+        try:
+            if not bot_is_present_in_group(int(chat_id), bot_me_id=bot_me_id):
+                continue
+        except Exception:
+            pass
+
+        sent_to_group = send_message_with_retry(int(chat_id), body, parse_mode="HTML")
+        if sent_to_group:
+            group_sent += 1
+            try:
+                remember_group_chat(int(chat_id))
+            except Exception:
+                pass
+        else:
+            group_failed += 1
+            time.sleep(0.05)
+            continue
+
+        for uid in uids:
+            if uid in covered_uids:
+                continue
+            try:
+                mem = bot.get_chat_member(int(chat_id), int(uid))
+                st = str(getattr(mem, "status", "") or "")
+                if st and st not in ("left", "kicked"):
+                    covered_uids.add(int(uid))
+            except Exception:
+                pass
+            time.sleep(0.02)
+
+        time.sleep(0.05)
+
+    pm_sent = 0
+    pm_failed = 0
+    pm_skipped = 0
+
+    for uid in uids:
+        if uid in covered_uids:
+            continue
+        if respect_pm_settings and (not user_pm_notifications_enabled(int(uid))):
+            pm_skipped += 1
+            continue
+        if send_message_with_retry(int(uid), body, parse_mode="HTML"):
+            pm_sent += 1
+        else:
+            pm_failed += 1
+        time.sleep(0.03)
+
+    return {
+        "groups_sent": group_sent,
+        "groups_failed": group_failed,
+        "groups_checked": group_checked,
+        "covered": len(covered_uids),
+        "pm_sent": pm_sent,
+        "pm_failed": pm_failed,
+        "pm_skipped": pm_skipped,
+    }
+
 def _touch_group_from_message(message) -> None:
     try:
         chat = getattr(message, "chat", None)
@@ -1364,11 +1727,63 @@ def _touch_group_from_callback(call: CallbackQuery) -> None:
 )
 def _track_any_group_message(message):
     _touch_group_from_message(message)
+    try:
+        sleeping, _mode, _reason, _last_err = get_bot_sleep_state()
+        if sleeping and (not _allow_message_during_sleep(message)):
+            try:
+                chat_id = int(getattr(getattr(message, "chat", None), "id", 0) or 0)
+            except Exception:
+                chat_id = 0
+            try:
+                uid = int(getattr(getattr(message, "from_user", None), "id", 0) or 0)
+            except Exception:
+                uid = 0
+
+            if chat_id != 0 and uid != 0 and _sleep_notice_cooldown_ok(chat_id, uid, sec=30):
+                try:
+                    bot.send_message(chat_id, build_sleep_notice_text(), parse_mode="HTML")
+                except Exception:
+                    pass
+            return
+
+    except Exception:
+        pass
+
     return ContinueHandling()
 
 @bot.callback_query_handler(func=lambda c: True)
 def _track_any_group_callback(call: CallbackQuery):
     _touch_group_from_callback(call)
+    try:
+        sleeping, _mode, _reason, _last_err = get_bot_sleep_state()
+        if sleeping and (not _allow_callback_during_sleep(call)):
+            try:
+                bot.answer_callback_query(call.id, "Бот временно отключён (технические работы).", show_alert=True)
+            except Exception:
+                pass
+
+            try:
+                msg = getattr(call, "message", None)
+                chat = getattr(msg, "chat", None) if msg else None
+                chat_id = int(getattr(chat, "id", 0) or 0) if chat else 0
+            except Exception:
+                chat_id = 0
+
+            try:
+                uid = int(getattr(getattr(call, "from_user", None), "id", 0) or 0)
+            except Exception:
+                uid = 0
+
+            if chat_id != 0 and uid != 0 and _sleep_notice_cooldown_ok(chat_id, uid, sec=30):
+                try:
+                    bot.send_message(chat_id, build_sleep_notice_text(), parse_mode="HTML")
+                except Exception:
+                    pass
+
+            return
+    except Exception:
+        pass
+
     return ContinueHandling()
 
 def get_known_broadcast_group_ids() -> List[int]:
@@ -4644,7 +5059,27 @@ def on_inline(q: InlineQuery):
     uid = q.from_user.id
     username = getattr(q.from_user, "username", None)
     upsert_user(uid, username)
-    
+    try:
+        sleeping, _mode, _reason, _last_err = get_bot_sleep_state()
+        if sleeping and (not is_bot_admin(uid)):
+            text = "Бот временно отключён (технические работы)."
+            try:
+                res = InlineQueryResultArticle(
+                    id=str(uuid.uuid4()),
+                    title="Бот временно отключён",
+                    description="Технические работы / аварийный режим",
+                    input_message_content=InputTextMessageContent(text)
+                )
+                bot.answer_inline_query(q.id, [res], cache_time=5, is_personal=True)
+            except Exception:
+                try:
+                    bot.answer_inline_query(q.id, [], cache_time=5, is_personal=True)
+                except Exception:
+                    pass
+            return
+    except Exception:
+        pass
+
     # Бан (inline)
     banned, until_ts, reason = get_ban_info(uid)
     if banned:
@@ -4879,7 +5314,7 @@ def on_inline(q: InlineQuery):
         kb = InlineKeyboardMarkup()
         kb.add(InlineKeyboardButton("Статистика по играм", callback_data=cb_pack("profile:games", uid)))
         kb.add(InlineKeyboardButton("Контракт", callback_data=cb_pack("profile:contract", uid)))
-        if uid == OWNER_ID:
+        if is_bot_admin(uid):
             kb.add(InlineKeyboardButton("Команды", callback_data=cb_pack("profile:commands", uid)))
         if credit_has_active(uid):
             kb.add(InlineKeyboardButton("Договор по кредиту", callback_data=cb_pack("profile:credit", uid)))
@@ -5405,41 +5840,56 @@ def on_main_callbacks(call: CallbackQuery):
         edit_inline_or_message(call, text, reply_markup=kb, parse_mode="HTML")
         bot.answer_callback_query(call.id)
         return
-
+    
     if kind == "profile" and parts[1] == "commands":
-        if clicker != OWNER_ID:
+        if not is_bot_admin(clicker):
             bot.answer_callback_query(call.id, "Недостаточно прав.", show_alert=True)
             return
 
-        text = ( # админ команды
-            "Список команд модерирования\n\n"
-            "☛ профиль /profile\n"
-            "☛ рассылка /remessage\n"
-            "☛ чаты /chatlist\n"
-            "Статусы ☚\n"
-            "☛ кастомный /addstatus\n"
-            "☛ демон /devil\n"
-            "☛ человек /human\n"
-            "☛ удалить раба /delrab\n"
-            "Регистрация ☚\n"
-            "☛ перерегистрация юзера /reg \n"
-            "☛ удаление юзера /del\n"
-            "☛ бан юзера /ban\n"
-            "☛ разбан юзера /unban\n"
-            "Редактирование ☚\n"
-            "ㅤфинансы ☚\n"
-            "ㅤ☛ выдать /finance\n"
-            "ㅤ☛ забрать /take\n"
-            "ㅤ☛ разблокировка /udblockcash\n"
-            "ㅤ☛ блокировка /blockcash\n"
-            "☛ работа /work"
-            "☛ чистка чатов /clearpm\n"
-        )
+        lines = [
+            "Список команд модерирования",
+            "",
+            f"Состояние бота: <b>{html_escape(bot_status_human())}</b> ☚",            
+            "☛ рассылка /remessage",
+            "☛ чаты /chatlist",
+            "Статусы ☚",
+            "☛ кастомный /addstatus",
+            "☛ демон /devil",
+            "☛ человек /human",
+            "☛ удалить раба /delrab",
+            "Регистрация ☚",
+            "☛ перерегистрация юзера /reg",
+            "☛ удаление юзера /del",
+            "☛ бан юзера /ban",
+            "☛ разбан юзера /unban",
+            "Редактирование ☚",
+            "ㅤфинансы ☚",
+            "ㅤ☛ выдать /finance",
+            "ㅤ☛ забрать /take",
+            "ㅤ☛ разблокировка /udblockcash",
+            "ㅤ☛ блокировка /blockcash",
+            "☛ работа /work",
+            "☛ чистка чатов /clearpm",
+        ]
+
+        if clicker == OWNER_ID:
+            lines += [
+                "",
+                "Владелец ☚",
+                "☛ добавить админа /add_admin",
+                "☛ убрать админа /remove_admin",
+                "☛ список админов /admins",
+                "☛ база данных /db",
+                "☛ включить бота /bot_on",
+                "☛ выключить бота /bot_off {error|update}",
+            ]
+
+        text = "\n".join(lines)
 
         kb = InlineKeyboardMarkup()
         kb.add(InlineKeyboardButton("Назад в профиль", callback_data=cb_pack("profile:open", clicker)))
 
-        edit_inline_or_message(call, text, reply_markup=kb, parse_mode=None)
+        edit_inline_or_message(call, text, reply_markup=kb, parse_mode="HTML")
         bot.answer_callback_query(call.id)
         return
 
@@ -8919,13 +9369,17 @@ def build_profile_summary_text(view_uid: int) -> Optional[str]:
     place = (uids.index(int(view_uid)) + 1) if (int(u[7] or 0) == 0 and int(view_uid) in uids) else "-"
     status = compute_status(int(view_uid))
 
-    return (
+    base = (
         f"Имя пользователя: <i>{html_escape(u[2])}</i>\n"
         f"Дата подписания контракта: <b>{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(u[4] or u[3] or now_ts()))}</b>\n"
         f"Статус: <b>{html_escape(status)}</b>\n"
         f"Капитал: <b>{cents_to_money_str(int(u[5] or 0))}</b>$\n"
         f"Место в топе: <b>{place}</b>"
     )
+    if int(view_uid) == int(OWNER_ID):
+        base += f"\n\nСостояние бота: <b>{html_escape(bot_status_human())}</b>"
+
+    return base    
 
 def build_profile_open_kb(uid: int) -> InlineKeyboardMarkup:
     uid = int(uid)
@@ -8933,7 +9387,7 @@ def build_profile_open_kb(uid: int) -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton("Статистика по играм", callback_data=cb_pack("profile:games", uid)))
     kb.add(InlineKeyboardButton("Контракт", callback_data=cb_pack("profile:contract", uid)))
-    if uid == OWNER_ID:
+    if is_bot_admin(uid):
         kb.add(InlineKeyboardButton("Команды", callback_data=cb_pack("profile:commands", uid)))
     if credit_has_active(uid):
         kb.add(InlineKeyboardButton("Договор по кредиту", callback_data=cb_pack("profile:credit", uid)))
@@ -9390,7 +9844,7 @@ def apply_demon_life_settlement(game_id: str):
 def cmd_devil(message):
     if message.chat.type != "private":
         return
-    if message.from_user.id != OWNER_ID:
+    if not is_bot_admin(message.from_user.id):
         return
     parts = message.text.split()
     target = message.from_user.id
@@ -9425,8 +9879,7 @@ threading.Thread(target=_pm_autodelete_daemon, daemon=True).start()
 def cmd_human(message):
     if message.chat.type != "private":
         return
-
-    if message.from_user.id != OWNER_ID:
+    if not is_bot_admin(message.from_user.id):
         return
     parts = message.text.split()
     target = message.from_user.id
@@ -9445,7 +9898,7 @@ def cmd_human(message):
 
 @bot.message_handler(commands=["finance"])
 def cmd_finance(message):
-    if message.from_user.id != OWNER_ID:
+    if not is_bot_admin(message.from_user.id):
         return
     if message.chat.type != "private":
         return
@@ -9547,7 +10000,7 @@ def cmd_finance(message):
 
 @bot.message_handler(commands=["take"])
 def cmd_take(message):
-    if message.from_user.id != OWNER_ID:
+    if not is_bot_admin(message.from_user.id):
         return
     if message.chat.type != "private":
         return
@@ -9577,7 +10030,7 @@ def cmd_take(message):
 
 @bot.message_handler(commands=["addstatus"])
 def cmd_addstatus(message):
-    if message.from_user.id != OWNER_ID:
+    if not is_bot_admin(message.from_user.id):
         return
     if message.chat.type != "private":
         return
@@ -9609,7 +10062,7 @@ def cmd_addstatus(message):
 
 @bot.message_handler(commands=["reg"])
 def cmd_reg(message):
-    if message.from_user.id != OWNER_ID:
+    if not is_bot_admin(message.from_user.id):
         return
     if message.chat.type != "private":
         return
@@ -9671,7 +10124,7 @@ def cmd_reg(message):
 
 @bot.message_handler(commands=["work"])
 def cmd_work(message):
-    if message.from_user.id != OWNER_ID:
+    if not is_bot_admin(message.from_user.id):
         return
     if message.chat.type != "private":
         return
@@ -9746,7 +10199,7 @@ def cmd_work(message):
 
 @bot.message_handler(commands=["delrab"])
 def cmd_delstat(message):
-    if message.from_user.id != OWNER_ID:
+    if not is_bot_admin(message.from_user.id):
         return
 
     parts = (message.text or "").split()
@@ -9770,7 +10223,7 @@ def cmd_delstat(message):
 
 @bot.message_handler(commands=["blockcash"])
 def cmd_blockcash(message):
-    if message.from_user.id != OWNER_ID:
+    if not is_bot_admin(message.from_user.id):
         return
 
     raw = (message.text or "").strip()
@@ -9864,7 +10317,7 @@ def cmd_blockcash(message):
 
 @bot.message_handler(commands=["udblockcash"])
 def cmd_udblockcash(message):
-    if message.from_user.id != OWNER_ID:
+    if not is_bot_admin(message.from_user.id):
         return
 
     parts = (message.text or "").split(maxsplit=1)
@@ -9937,7 +10390,7 @@ def cmd_udblockcash(message):
 
 @bot.message_handler(commands=["remessage"])
 def cmd_remessage(message):
-    if message.from_user.id != OWNER_ID:
+    if not is_bot_admin(message.from_user.id):
         return
     if message.chat.type != "private":
         return
@@ -10076,7 +10529,7 @@ def cmd_remessage(message):
 
 @bot.message_handler(commands=["chatlist"])
 def cmd_chatlist(message):
-    if message.from_user.id != OWNER_ID:
+    if not is_bot_admin(message.from_user.id):
         return
     if message.chat.type != "private":
         return
@@ -10149,7 +10602,7 @@ def cmd_chatlist(message):
 
 @bot.message_handler(commands=["clearpm"])
 def cmd_clearpm(message):
-    if message.from_user.id != OWNER_ID:
+    if not is_bot_admin(message.from_user.id):
         return
     if message.chat.type != "private":
         return
@@ -10180,7 +10633,7 @@ def cmd_clearpm(message):
 
 @bot.message_handler(commands=["del"])
 def cmd_del(message):
-    if message.from_user.id != OWNER_ID:
+    if not is_bot_admin(message.from_user.id):
         return
 
     parts = (message.text or "").split()
@@ -10277,7 +10730,7 @@ def cmd_del(message):
 
 @bot.message_handler(commands=["ban"])
 def cmd_ban(message):
-    if message.from_user.id != OWNER_ID:
+    if not is_bot_admin(message.from_user.id):
         return
 
     raw = message.text or ""
@@ -10319,7 +10772,7 @@ def cmd_ban(message):
         bot.reply_to(message, "Нельзя заблокировать владельца бота.")
         return
 
-    until_ts = ban_user(target_id, by_id=OWNER_ID, reason=reason, duration_sec=duration_sec)
+    until_ts = ban_user(target_id, by_id=message.from_user.id, reason=reason, duration_sec=duration_sec)
 
     try:
         msg = "Ваш аккаунт заблокирован администратором"
@@ -10346,7 +10799,7 @@ def cmd_ban(message):
 
 @bot.message_handler(commands=["unban"])
 def cmd_unban(message):
-    if message.from_user.id != OWNER_ID:
+    if not is_bot_admin(message.from_user.id):
         return
 
     txt = (message.text or "").strip()
@@ -10368,7 +10821,7 @@ def cmd_unban(message):
         bot.reply_to(message, "Владелец бота не может быть забанен.")
         return
 
-    unban_user(target_id, by_id=OWNER_ID, reason=reason)
+    unban_user(target_id, by_id=message.from_user.id, reason=reason)
 
     try:
         bot.send_message(target_id, "Ваш аккаунт разблокирован администратором.")
@@ -10376,6 +10829,227 @@ def cmd_unban(message):
         pass
 
     bot.reply_to(message, f"Пользователь @{uname} разблокирован.")
+
+# OWNER COMMANDS
+@bot.message_handler(commands=["add_admin"])
+def cmd_add_admin(message):
+    if message.from_user.id != OWNER_ID:
+        return
+
+    target_id: Optional[int] = None
+    target_uname: Optional[str] = None
+
+    if message.reply_to_message:
+        u = getattr(message.reply_to_message, "from_user", None)
+        if u:
+            target_id = int(getattr(u, "id", 0) or 0)
+            target_uname = getattr(u, "username", None)
+    else:
+        parts = (message.text or "").split(maxsplit=1)
+        if len(parts) >= 2:
+            ref = parts[1].strip()
+            if ref.startswith("@"):
+                rr = db_one("SELECT user_id FROM users WHERE username=? COLLATE NOCASE", (ref[1:],))
+                target_id = int(rr[0]) if rr else None
+            elif ref.isdigit():
+                target_id = int(ref)
+
+    if not target_id:
+        bot.reply_to(message, "Использование: /add_admin @username\nили ответом на сообщение.")
+        return
+
+    if int(target_id) == int(OWNER_ID):
+        bot.reply_to(message, "Владелец уже имеет все права.")
+        return
+
+    upsert_user(int(target_id), target_uname)
+    set_bot_admin(int(target_id), True, by_id=int(OWNER_ID))
+
+    bot.reply_to(message, "Готово. Администратор назначен.")
+    try:
+        bot.send_message(int(target_id), "Вам выдан статус администратора бота.")
+    except Exception:
+        pass
+
+@bot.message_handler(commands=["remove_admin"])
+def cmd_remove_admin(message):
+    if message.from_user.id != OWNER_ID:
+        return
+
+    target_id: Optional[int] = None
+    target_uname: Optional[str] = None
+
+    if message.reply_to_message:
+        u = getattr(message.reply_to_message, "from_user", None)
+        if u:
+            target_id = int(getattr(u, "id", 0) or 0)
+            target_uname = getattr(u, "username", None)
+    else:
+        parts = (message.text or "").split(maxsplit=1)
+        if len(parts) >= 2:
+            ref = parts[1].strip()
+            if ref.startswith("@"):
+                rr = db_one("SELECT user_id FROM users WHERE username=? COLLATE NOCASE", (ref[1:],))
+                target_id = int(rr[0]) if rr else None
+            elif ref.isdigit():
+                target_id = int(ref)
+
+    if not target_id:
+        bot.reply_to(message, "Использование: /remove_admin @username\nили ответом на сообщение.")
+        return
+
+    if int(target_id) == int(OWNER_ID):
+        bot.reply_to(message, "Нельзя снять права с владельца.")
+        return
+
+    upsert_user(int(target_id), target_uname)
+    set_bot_admin(int(target_id), False, by_id=int(OWNER_ID))
+
+    bot.reply_to(message, "Готово. Администратор разжалован.")
+    try:
+        bot.send_message(int(target_id), "Ваш статус администратора бота снят.")
+    except Exception:
+        pass
+
+@bot.message_handler(commands=["db"])
+def cmd_db(message):
+    if message.from_user.id != OWNER_ID:
+        return
+    if message.chat.type != "private":
+        bot.reply_to(message, "Команда /db доступна только в личных сообщениях с ботом.")
+        return
+
+    try:
+        with open(DB_PATH, "rb") as f:
+            bot.send_document(message.chat.id, f, caption="База данных бота")
+    except Exception as e:
+        bot.reply_to(message, f"Не удалось отправить базу данных: {e}")
+
+@bot.message_handler(commands=["bot_off"])
+def cmd_bot_off(message):
+    if message.from_user.id != OWNER_ID:
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    mode = (parts[1].strip().lower() if len(parts) >= 2 else "")
+    if mode not in ("error", "update"):
+        bot.reply_to(message, "Использование: /bot_off error\nили\n/bot_off update")
+        return
+
+    set_bot_sleep(mode, reason="")
+
+    body = build_sleep_notice_text()
+    stats = broadcast_notice(body, respect_pm_settings=True)
+
+    bot.reply_to(
+        message,
+        "Готово. Бот переведён в спящий режим.\n"
+        f"Групп: отправлено {stats.get('groups_sent',0)}, ошибок {stats.get('groups_failed',0)}\n"
+        f"ЛС: отправлено {stats.get('pm_sent',0)}, пропущено {stats.get('pm_skipped',0)}, ошибок {stats.get('pm_failed',0)}"
+    )
+
+@bot.message_handler(commands=["bot_on"])
+def cmd_bot_on(message):
+    if message.from_user.id != OWNER_ID:
+        return
+
+    clear_bot_sleep()
+
+    amt = 111111  # компенсация 1111,11$
+    comment = "Компенсация на время технических работ. Администратор"
+    payload = base64.urlsafe_b64encode(comment.encode("utf-8")).decode("ascii")
+
+    rows = db_all("SELECT user_id FROM users WHERE COALESCE(contract_ts,0) > 0 ORDER BY user_id", ()) or []
+    mailed = 0
+    instant = 0
+    failed = 0
+
+    for (uid,) in rows:
+        uid = int(uid)
+        try:
+            if user_pm_notifications_enabled(uid):
+                ensure_daily_mail_row(uid)
+                _send_mail_prompt(uid, f"owner_finance|{payload}", int(amt))
+                mailed += 1
+            else:
+                add_balance(uid, int(amt))
+                instant += 1
+        except Exception:
+            failed += 1
+        time.sleep(0.02)
+
+    notify = "✅ Работа бота восстановлена! Благодарю Вас за ожидание. Администратор"
+    nstats = broadcast_notice(notify, respect_pm_settings=True)
+
+    bot.reply_to(
+        message,
+        "✅ Бот включён.\n"
+        f"Компенсация: писем {mailed}, сразу зачислено {instant}, ошибок {failed}.\n"
+        f"Уведомление: групп {nstats.get('groups_sent',0)}, ЛС {nstats.get('pm_sent',0)}, "
+        f"пропущено {nstats.get('pm_skipped',0)}."
+    )
+
+@bot.message_handler(commands=["admins"])
+def cmd_admins(message):
+    # можно разрешить бот-админам смотреть список, но без OWNER строк
+    if not is_bot_admin(message.from_user.id):
+        return
+    if message.chat.type != "private":
+        return
+
+    rows = db_all("""
+        SELECT a.user_id,
+               COALESCE(u.short_name,'') AS name,
+               COALESCE(u.username,'')   AS uname,
+               COALESCE(a.added_ts,0)    AS added_ts,
+               COALESCE(a.added_by,0)    AS added_by
+        FROM bot_admins a
+        LEFT JOIN users u ON u.user_id=a.user_id
+        ORDER BY COALESCE(a.added_ts,0) DESC, a.user_id ASC
+    """, ()) or []
+
+    lines = []
+    lines.append("👮 Администраторы бота")
+    lines.append(f"Состояние бота: <b>{html_escape(bot_status_human())}</b>")
+    lines.append("")
+
+    owner_u = db_one("SELECT COALESCE(short_name,''), COALESCE(username,'') FROM users WHERE user_id=?", (int(OWNER_ID),))
+    owner_name = (owner_u[0] if owner_u else "") or "Владелец"
+    owner_un = (owner_u[1] if owner_u else "") or ""
+    owner_un_part = f" (@{html_escape(owner_un)})" if owner_un else ""
+    lines.append(f"• <b>{html_escape(owner_name)}</b>{owner_un_part} — <code>{int(OWNER_ID)}</code> (OWNER)")
+
+    if not rows:
+        lines.append("")
+        lines.append("Список бот-админов пуст.")
+        bot.send_message(message.chat.id, "\n".join(lines), parse_mode="HTML")
+        return
+
+    lines.append("")
+    lines.append("Бот-админы:")
+
+    for uid, name, uname, added_ts, added_by in rows:
+        uid = int(uid or 0)
+        if uid == int(OWNER_ID):
+            continue
+
+        nm = (name or "").strip() or "Без имени"
+        un = (uname or "").strip()
+        un_part = f" (@{html_escape(un)})" if un else ""
+
+        ts_txt = "-"
+        try:
+            if int(added_ts or 0) > 0:
+                ts_txt = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(int(added_ts)))
+        except Exception:
+            ts_txt = "-"
+
+        by_txt = ""
+        if message.from_user.id == OWNER_ID and int(added_by or 0) > 0:
+            by_txt = f", by <code>{int(added_by)}</code>"
+
+        lines.append(f"• <b>{html_escape(nm)}</b>{un_part} — <code>{uid}</code> (с {html_escape(ts_txt)}{by_txt})")
+
+    bot.send_message(message.chat.id, "\n".join(lines), parse_mode="HTML")
 
 # DIFFERENT COMMANDS
 @bot.message_handler(commands=["get"])
