@@ -69,6 +69,8 @@ bot = TeleBot(BOT_TOKEN, threaded=True, num_threads=8)
 
 # MAINTENANCE GATES
 _SLEEP_CHAT_LAST_TS: Dict[int, int] = {}
+_FORCE_SLEEPING: bool = False
+_FORCE_SLEEP_MODE: str = ""  # "error"|"update"
 
 def _sleep_chat_cooldown_ok(chat_id: int, sec: int = 300) -> bool:
     chat_id = int(chat_id or 0)
@@ -146,27 +148,34 @@ def _maintenance_gate_callback(call: CallbackQuery):
     except Exception:
         pass
 
-    try:
-        sleeping, _mode, _reason, _last_err = get_bot_sleep_state()
-        if not sleeping:
-            return ContinueHandling()
-
-        uid = int(getattr(getattr(call, "from_user", None), "id", 0) or 0)
-        if is_bot_admin(uid):
-            return ContinueHandling()
-
-        data = str(getattr(call, "data", "") or "")
-        if data.startswith("report:"):
-            return ContinueHandling()
-
+    sleeping = bool(_FORCE_SLEEPING)
+    if not sleeping:
         try:
-            bot.answer_callback_query(call.id, "Бот временно отключён (технические работы).", show_alert=True)
+            sleeping, _mode, _reason, _last_err = get_bot_sleep_state()
         except Exception:
-            pass
-        return
+            sleeping = False
 
-    except Exception:
+    if not sleeping:
         return ContinueHandling()
+
+    try:
+        data = str(getattr(call, "data", "") or "")
+    except Exception:
+        data = ""
+
+    allow = (
+        data.startswith("report:")
+        or data.startswith("profile:commands")
+        or data.startswith("profile:open")
+    )
+    if allow:
+        return ContinueHandling()
+
+    try:
+        bot.answer_callback_query(call.id, "Бот временно отключён (технические работы).", show_alert=True)
+    except Exception:
+        pass
+    return
 
 # Коды ошибок 
 _ERROR_REPORT_LAST: dict[str, int] = {}
@@ -5108,26 +5117,54 @@ def on_inline(q: InlineQuery):
     uid = q.from_user.id
     username = getattr(q.from_user, "username", None)
     upsert_user(uid, username)
-    try:
-        sleeping, _mode, _reason, _last_err = get_bot_sleep_state()
-        if sleeping and (not is_bot_admin(uid)):
-            text = "Бот временно отключён (технические работы)."
+    sleeping = bool(_FORCE_SLEEPING)
+    if not sleeping:
+        try:
+            sleeping, _mode, _reason, _last_err = get_bot_sleep_state()
+        except Exception:
+            sleeping = False
+
+    if sleeping:
+        u = get_user(uid)
+
+        if u and u[2]:
+            uid2, uname, short_name, created_ts, contract_ts, bal, gift, demon = u
+            status = compute_status(uid)
+
             try:
-                res = InlineQueryResultArticle(
-                    id=str(uuid.uuid4()),
-                    title="Бот временно отключён",
-                    description="Технические работы / аварийный режим",
-                    input_message_content=InputTextMessageContent(text)
-                )
-                bot.answer_inline_query(q.id, [res], cache_time=5, is_personal=True)
+                cur.execute("SELECT user_id FROM users WHERE demon=0")
+                uids = [r[0] for r in cur.fetchall()]
+                uids.sort(key=lambda x: top_value_cents(x), reverse=True)
+                place = (uids.index(uid2) + 1) if (int(demon or 0) == 0 and uid2 in uids) else "-"
             except Exception:
-                try:
-                    bot.answer_inline_query(q.id, [], cache_time=5, is_personal=True)
-                except Exception:
-                    pass
-            return
-    except Exception:
-        pass
+                place = "-"
+
+            text = (
+                f"Имя пользователя: <i>{html_escape(short_name)}</i>\n"
+                f"Дата подписания контракта: <b>{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(contract_ts or created_ts or now_ts()))}</b>\n"
+                f"Статус: <b>{html_escape(status)}</b>\n"
+                f"Капитал: <b>{cents_to_money_str(int(bal or 0))}</b>$\n"
+                f"Место в топе: <b>{place}</b>\n\n"
+                "<b>⛔ Бот временно отключён. Игры и остальные функции недоступны.</b>"
+            )
+        else:
+            text = "<b>⛔ Бот временно отключён.</b>\nПрофиль недоступен (нет анкеты)."
+
+        kb = None
+        if is_bot_admin(uid):
+            kb = InlineKeyboardMarkup()
+            kb.add(InlineKeyboardButton("Команды", callback_data=cb_pack("profile:commands", uid)))
+
+        results = [inline_article(
+            "Профиль",
+            "Основная сводка по вашей деятельности в боте",
+            text,
+            kb,
+            thumb_key="profile"
+        )]
+
+        bot.answer_inline_query(q.id, results, cache_time=0, is_personal=True)
+        return
 
     # Бан (inline)
     banned, until_ts, reason = get_ban_info(uid)
@@ -10984,6 +11021,10 @@ def cmd_bot_off(message):
         bot.reply_to(message, "Использование: /bot_off error\nили\n/bot_off update")
         return
 
+    global _FORCE_SLEEPING, _FORCE_SLEEP_MODE
+    _FORCE_SLEEPING = True
+    _FORCE_SLEEP_MODE = mode
+
     set_bot_sleep(mode, reason="")
 
     body = build_sleep_notice_text()
@@ -11000,6 +11041,10 @@ def cmd_bot_off(message):
 def cmd_bot_on(message):
     if message.from_user.id != OWNER_ID:
         return
+
+    global _FORCE_SLEEPING, _FORCE_SLEEP_MODE
+    _FORCE_SLEEPING = False
+    _FORCE_SLEEP_MODE = ""
 
     clear_bot_sleep()
 
