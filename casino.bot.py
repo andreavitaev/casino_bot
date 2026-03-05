@@ -67,6 +67,107 @@ BOT_TOKEN = load_bot_token()
 
 bot = TeleBot(BOT_TOKEN, threaded=True, num_threads=8)
 
+# MAINTENANCE GATES
+_SLEEP_CHAT_LAST_TS: Dict[int, int] = {}
+
+def _sleep_chat_cooldown_ok(chat_id: int, sec: int = 300) -> bool:
+    chat_id = int(chat_id or 0)
+    now = int(time.time())
+    prev = int(_SLEEP_CHAT_LAST_TS.get(chat_id, 0) or 0)
+    if (now - prev) < int(sec):
+        return False
+    _SLEEP_CHAT_LAST_TS[chat_id] = now
+    return True
+
+@bot.message_handler(
+    func=lambda m: True,
+    content_types=[
+        "text", "photo", "audio", "document", "animation", "game",
+        "video", "voice", "video_note", "location", "contact",
+        "sticker", "venue", "dice", "new_chat_members",
+        "left_chat_member", "pinned_message"
+    ]
+)
+def _maintenance_gate_message(message):
+    try:
+        _touch_group_from_message(message)
+    except Exception:
+        pass
+
+    try:
+        sleeping, _mode, _reason, _last_err = get_bot_sleep_state()
+        if not sleeping:
+            return ContinueHandling()
+
+        uid = int(getattr(getattr(message, "from_user", None), "id", 0) or 0)
+        if is_bot_admin(uid):
+            return ContinueHandling()
+
+        txt = (getattr(message, "text", "") or "").strip()
+
+        if txt.startswith("/report"):
+            return ContinueHandling()
+        if getattr(getattr(message, "chat", None), "type", "") == "private":
+            try:
+                rs = db_one("SELECT 1 FROM report_state WHERE user_id=? LIMIT 1", (uid,))
+                if rs:
+                    return ContinueHandling()
+            except Exception:
+                pass
+
+        chat = getattr(message, "chat", None)
+        chat_id = int(getattr(chat, "id", 0) or 0)
+        chat_type = str(getattr(chat, "type", "") or "")
+
+        if chat_type in ("group", "supergroup"):
+            if not txt.startswith("/"):
+                return
+            if chat_id and _sleep_chat_cooldown_ok(chat_id, sec=300):
+                try:
+                    bot.send_message(chat_id, build_sleep_notice_text(), parse_mode="HTML")
+                except Exception:
+                    pass
+            return
+
+        if chat_id and _sleep_chat_cooldown_ok(chat_id, sec=300):
+            try:
+                bot.send_message(chat_id, build_sleep_notice_text(), parse_mode="HTML")
+            except Exception:
+                pass
+        return
+
+    except Exception:
+        return ContinueHandling()
+
+@bot.callback_query_handler(func=lambda c: True)
+def _maintenance_gate_callback(call: CallbackQuery):
+    try:
+        _touch_group_from_callback(call)
+    except Exception:
+        pass
+
+    try:
+        sleeping, _mode, _reason, _last_err = get_bot_sleep_state()
+        if not sleeping:
+            return ContinueHandling()
+
+        uid = int(getattr(getattr(call, "from_user", None), "id", 0) or 0)
+        if is_bot_admin(uid):
+            return ContinueHandling()
+
+        data = str(getattr(call, "data", "") or "")
+        if data.startswith("report:"):
+            return ContinueHandling()
+
+        try:
+            bot.answer_callback_query(call.id, "Бот временно отключён (технические работы).", show_alert=True)
+        except Exception:
+            pass
+        return
+
+    except Exception:
+        return ContinueHandling()
+
 # Коды ошибок 
 _ERROR_REPORT_LAST: dict[str, int] = {}
 ERROR_REPORT_COOLDOWN_SEC = 60
@@ -1727,63 +1828,11 @@ def _touch_group_from_callback(call: CallbackQuery) -> None:
 )
 def _track_any_group_message(message):
     _touch_group_from_message(message)
-    try:
-        sleeping, _mode, _reason, _last_err = get_bot_sleep_state()
-        if sleeping and (not _allow_message_during_sleep(message)):
-            try:
-                chat_id = int(getattr(getattr(message, "chat", None), "id", 0) or 0)
-            except Exception:
-                chat_id = 0
-            try:
-                uid = int(getattr(getattr(message, "from_user", None), "id", 0) or 0)
-            except Exception:
-                uid = 0
-
-            if chat_id != 0 and uid != 0 and _sleep_notice_cooldown_ok(chat_id, uid, sec=30):
-                try:
-                    bot.send_message(chat_id, build_sleep_notice_text(), parse_mode="HTML")
-                except Exception:
-                    pass
-            return
-
-    except Exception:
-        pass
-
     return ContinueHandling()
 
 @bot.callback_query_handler(func=lambda c: True)
 def _track_any_group_callback(call: CallbackQuery):
     _touch_group_from_callback(call)
-    try:
-        sleeping, _mode, _reason, _last_err = get_bot_sleep_state()
-        if sleeping and (not _allow_callback_during_sleep(call)):
-            try:
-                bot.answer_callback_query(call.id, "Бот временно отключён (технические работы).", show_alert=True)
-            except Exception:
-                pass
-
-            try:
-                msg = getattr(call, "message", None)
-                chat = getattr(msg, "chat", None) if msg else None
-                chat_id = int(getattr(chat, "id", 0) or 0) if chat else 0
-            except Exception:
-                chat_id = 0
-
-            try:
-                uid = int(getattr(getattr(call, "from_user", None), "id", 0) or 0)
-            except Exception:
-                uid = 0
-
-            if chat_id != 0 and uid != 0 and _sleep_notice_cooldown_ok(chat_id, uid, sec=30):
-                try:
-                    bot.send_message(chat_id, build_sleep_notice_text(), parse_mode="HTML")
-                except Exception:
-                    pass
-
-            return
-    except Exception:
-        pass
-
     return ContinueHandling()
 
 def get_known_broadcast_group_ids() -> List[int]:
