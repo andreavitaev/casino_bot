@@ -97,7 +97,10 @@ def _maintenance_gate_message(message):
         pass
 
     try:
-        sleeping, _mode, _reason, _last_err = get_bot_sleep_state()
+        sleeping = bool(_FORCE_SLEEPING)
+        if not sleeping:
+            sleeping, _mode, _reason, _last_err = get_bot_sleep_state()
+
         if not sleeping:
             return ContinueHandling()
 
@@ -122,13 +125,9 @@ def _maintenance_gate_message(message):
         chat_type = str(getattr(chat, "type", "") or "")
 
         if chat_type in ("group", "supergroup"):
-            if not txt.startswith("/"):
-                return
-            if chat_id and _sleep_chat_cooldown_ok(chat_id, sec=300):
-                try:
-                    bot.send_message(chat_id, build_sleep_notice_text(), parse_mode="HTML")
-                except Exception:
-                    pass
+            return
+
+        if not txt.startswith("/"):
             return
 
         if chat_id and _sleep_chat_cooldown_ok(chat_id, sec=300):
@@ -5900,28 +5899,12 @@ def on_main_callbacks(call: CallbackQuery):
         return
 
     if kind == "profile" and parts[1] == "open":
-        u = get_user(clicker)
-        if not u or not u[2]:
+        text = build_profile_summary_text(clicker)
+        if not text:
             edit_inline_or_message(call, "Вам пришло одно особенное письмо. Рекомендуем вам его проверить.", None, "HTML")
             bot.answer_callback_query(call.id)
             return
-
-        uid, uname, short_name, created_ts, contract_ts, bal, gift, demon = u
-        cur.execute("SELECT user_id FROM users WHERE demon=0")
-        uids = [r[0] for r in cur.fetchall()]
-        uids.sort(key=lambda x: top_value_cents(x), reverse=True)
-        place = (uids.index(uid) + 1) if (demon == 0 and uid in uids) else "-"
-
-        status = compute_status(uid)
-
-        text = (
-            f"Имя пользователя: <i>{html_escape(short_name)}</i>\n"
-            f"Дата подписания контракта: <b>{time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(contract_ts or created_ts or now_ts()))}</b>\n"
-            f"Статус: <b>{html_escape(status)}</b>\n"
-            f"Капитал: <b>{cents_to_money_str(int(bal or 0))}</b>$\n"
-            f"Место в топе: <b>{place}</b>"
-        )
-
+    
         kb = build_profile_open_kb(clicker)
         edit_inline_or_message(call, text, reply_markup=kb, parse_mode="HTML")
         bot.answer_callback_query(call.id)
@@ -9465,12 +9448,34 @@ def build_profile_summary_text(view_uid: int) -> Optional[str]:
     if int(view_uid) == int(OWNER_ID):
         base += f"\n\nСостояние бота: <b>{html_escape(bot_status_human())}</b>"
 
+    sleeping = bool(_FORCE_SLEEPING)
+    if not sleeping:
+        try:
+            sleeping, _mode, _reason, _last_err = get_bot_sleep_state()
+        except Exception:
+            sleeping = False
+    if sleeping:
+        base += "\n\n<b>⛔ Бот временно отключён. Игры и остальные функции недоступны.</b>"
+
     return base    
 
 def build_profile_open_kb(uid: int) -> InlineKeyboardMarkup:
     uid = int(uid)
 
+    sleeping = bool(_FORCE_SLEEPING)
+    if not sleeping:
+        try:
+            sleeping, _mode, _reason, _last_err = get_bot_sleep_state()
+        except Exception:
+            sleeping = False
+
     kb = InlineKeyboardMarkup()
+
+    if sleeping:
+        if is_bot_admin(uid):
+            kb.add(InlineKeyboardButton("Команды", callback_data=cb_pack("profile:commands", uid)))
+        return kb
+
     kb.add(InlineKeyboardButton("Статистика по играм", callback_data=cb_pack("profile:games", uid)))
     kb.add(InlineKeyboardButton("Контракт", callback_data=cb_pack("profile:contract", uid)))
     if is_bot_admin(uid):
